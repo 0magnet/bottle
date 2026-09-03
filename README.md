@@ -17,6 +17,14 @@ two page-global primitives:
   `127.0.0.1:<port>` in one instance is dialed from another — or from page
   JS via `vnet.httpFetch(port, method, path, body)`.
 
+- **`proc.js`** — a process layer: `proc.spawn({argv, env, cwd, stdio})`
+  instantiates another wasm module from jsfs as a child that shares the
+  page's fs and vnet, with per-process stdio and an exit promise. A tab has
+  no fork/exec, but instantiating a wasm module IS spawning a process — this
+  makes that a primitive, the third leg under a Unix-shaped orchestrator
+  (a shell, and eventually `go build`). The **`proc`** subpackage is its Go
+  adapter (`proc.Command(...).Run()`, os/exec-shaped).
+
 The **`vnet`** Go subpackage is the adapter: `vnet.Listen` /
 `vnet.DialTimeout` are exactly `net.Listen` / `net.DialTimeout` on native
 builds, and route loopback addresses through the page table under `js/wasm` —
