@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>bottle proc demo</title>
+<pre id="log" style="background:#0e0c14;color:#cdd2da;font:13px monospace;padding:1em"></pre>
+<script src="jsfs.js"></script>
+<script src="wasm_exec.js"></script>
+<script src="proc.js"></script>
+<script>
+(async function () {
+  const log = (l) => { const e=document.getElementById("log"); e.textContent += l + "\n"; try{console.log(l);}catch(_){} };
+  // Seed the child program into the page filesystem at /bin/child.
+  jsfs.mkdirp("/bin");
+  jsfs.writeFile("/bin/child", new Uint8Array(await (await fetch("child.wasm")).arrayBuffer()));
+  log("seeded /bin/child (" + jsfs.readFile("/bin/child").length + " bytes)");
+  // Run the parent as the page's root program; it spawns /bin/child via proc.
+  const go = new Go();
+  go.env = { PATH: "/bin", HOME: "/root", TMPDIR: "/tmp" };
+  const bytes = new Uint8Array(await (await fetch("parent.wasm")).arrayBuffer());
+  const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
+  go.run(instance);
+})();
+</script>
