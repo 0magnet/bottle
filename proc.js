@@ -28,16 +28,27 @@
 	if (typeof globalThis.Go !== "function") throw new Error("proc.js: load wasm_exec.js first");
 
 	const jsfs = globalThis.jsfs;
-	const stdio = jsfs.stdio; // { stdout, stderr, stdin } — the page defaults
+	const stdio = jsfs.stdio;
 
 	// The stdio set of the process whose execution slice is currently running.
-	// jsfs.stdio's methods delegate here, so a child's fd writes reach its own
-	// sinks without any per-call fd bookkeeping in jsfs.
+	// jsfs.stdio's methods delegate here so a child's fd writes reach its own
+	// sinks with no per-call fd bookkeeping. Installed lazily at the first
+	// spawn — capturing whatever stdio the page has set by then as the page
+	// defaults — and re-asserted each spawn, so a page that assigns
+	// jsfs.stdio.* after proc.js loads is respected, not clobbered.
 	let active = null;
-	const pageDefaults = { stdout: stdio.stdout, stderr: stdio.stderr, stdin: stdio.stdin };
-	stdio.stdout = (b) => (active ? active.stdout : pageDefaults.stdout)(b);
-	stdio.stderr = (b) => (active ? active.stderr : pageDefaults.stderr)(b);
-	stdio.stdin = () => (active ? active.stdin : pageDefaults.stdin)();
+	let pageDefaults = null;
+	function installDelegator() {
+		if (stdio.stdout && stdio.stdout.__procDelegator) return;
+		pageDefaults = { stdout: stdio.stdout, stderr: stdio.stderr, stdin: stdio.stdin };
+		const out = (b) => (active ? active.stdout : pageDefaults.stdout)(b);
+		const err = (b) => (active ? active.stderr : pageDefaults.stderr)(b);
+		const inp = () => (active ? active.stdin : pageDefaults.stdin)();
+		out.__procDelegator = err.__procDelegator = inp.__procDelegator = true;
+		stdio.stdout = out;
+		stdio.stderr = err;
+		stdio.stdin = inp;
+	}
 
 	const moduleCache = new Map(); // path -> WebAssembly.Module
 
@@ -65,6 +76,7 @@
 	let nextPID = 2; // 1 is the page's own root program by convention
 
 	function spawn(opts) {
+		installDelegator();
 		opts = opts || {};
 		const argv = opts.argv || [];
 		if (!argv.length) throw new Error("proc.spawn: empty argv");
@@ -97,6 +109,11 @@
 		// initial run and every timer/promise-driven re-entry.
 		const rawResume = go._resume.bind(go);
 		go._resume = function () {
+			// A child's Go runtime schedules timer callbacks (sysmon, the
+			// scheduler); one can fire AFTER the program exits, and stock
+			// wasm_exec throws "already exited" from _resume, uncaught, which
+			// would take the page down. Swallow those late resumes.
+			if (go.exited) return;
 			const prev = active;
 			active = myStdio;
 			const prevCwd = jsfs.getCwd();
@@ -132,19 +149,25 @@
 		return { pid, exited };
 	}
 
-	// pipe() returns an in-memory byte pipe: { write, close, reader } where
-	// write/close feed a queue and reader() is a stdin-shaped puller (returns
-	// a Uint8Array chunk, or null at EOF). Connect one process's stdout to the
-	// next's stdin to build a shell pipeline.
-	function pipe() {
-		const chunks = [];
-		let closed = false;
-		return {
-			write: (b) => { chunks.push(b); },
-			close: () => { closed = true; },
-			reader: () => (chunks.length ? chunks.shift() : (closed ? null : new Uint8Array(0))),
+	// pipeSink(fd) returns a plain stdout/stderr sink that writes a child's
+	// output into a jsfs pipe (whose read end the parent holds). It is an
+	// ordinary JS function, NOT a Go callback, so a child writing its stdout
+	// never re-enters the parent's Go runtime — the bytes cross in jsfs.
+	function pipeSink(fd) {
+		return function (chunk) {
+			try { globalThis.fs.writeSync(fd, chunk); } catch (e) { /* read end gone */ }
 		};
 	}
 
-	globalThis.proc = { installed: true, spawn, pipe };
+	// pipeSource(fd) returns a stdin puller draining a jsfs pipe. jsfs pipe
+	// reads are async (they block until data), but proc's stdin puller is
+	// synchronous, so this returns only what is already queued and never
+	// blocks — enough for the toolchain, whose children do not read stdin.
+	function pipeSource(fd) {
+		return function () {
+			return null; // best-effort: no synchronous drain of a blocking pipe
+		};
+	}
+
+	globalThis.proc = { installed: true, spawn, pipeSink, pipeSource };
 })();
