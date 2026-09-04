@@ -3,6 +3,15 @@
 A Linux-shaped bottle for wasm ships: the OS layer that lets Go programs run
 in a browser tab the way they run on a host.
 
+**Live demo** — bottle is the layer underneath rather than a thing to look at,
+so its demos are the programs that stand on it:
+**[shipwright](https://0magnet.github.io/shipwright/)** runs `cmd/compile` and
+`cmd/link` against bottle's jsfs, and
+**[shipyard](https://0magnet.github.io/shipyard/)** is a whole workstation on
+it — a shell, `go build`, processes and pipes, and a Go server the in-tab
+browser fetches from over bottle's vnet. Between them they exercise all three
+primitives: the filesystem, the network and the process layer.
+
 Big Go programs assume an operating system: a filesystem under `/`, config in
 `/etc`, localhost ports to listen on and dial. A browser tab has none of that,
 and Go's `wasm_exec.js` stubs it all with `ENOSYS`. bottle fills the gap with
