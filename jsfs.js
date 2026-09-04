@@ -103,7 +103,9 @@
 
 	function statOf(node) {
 		const isFile = node.data !== null;
-		const size = isFile ? node.data.length : (node.target !== null ? node.target.length : 64);
+		// A lazy file reports its real size before its bytes are fetched, so a
+		// caller that stats-then-reads (os.ReadFile) asks for the whole file.
+		const size = isFile ? (node.lazy ? node.lazy.size : node.data.length) : (node.target !== null ? node.target.length : 64);
 		return {
 			dev: 1, ino: node.ino, mode: node.mode, nlink: node.nlink,
 			uid: node.uid, gid: node.gid, rdev: 0, size,
@@ -134,6 +136,32 @@
 		f.data = typeof content === 'string' ? new TextEncoder().encode(content) : content;
 		dir.entries.set(norm.slice(norm.lastIndexOf('/') + 1), f);
 		return f;
+	}
+	// writeLazy seeds a file whose bytes are fetched from url on first read. The
+	// tree, names and sizes are present up front (cheap); content arrives only
+	// when something opens the file — so a caller seeds a whole source tree and
+	// pays network only for the files a build actually touches. Called after a
+	// mutation hook is installed, a lazy read's populate marks the fs dirty, so
+	// the fetched bytes persist like any write.
+	let lazyDirtyHook = null;
+	function writeLazy(path, size, url) {
+		const norm = normalize(path);
+		const dir = mkdirp(norm.slice(0, norm.lastIndexOf('/')) || '/');
+		const f = mknode(S_IFREG, 0o644);
+		f.data = new Uint8Array(0);
+		f.lazy = { size: size, url: url };
+		dir.entries.set(norm.slice(norm.lastIndexOf('/') + 1), f);
+		return f;
+	}
+	// readData serves a read from a file's resident bytes (the non-lazy path,
+	// and what a lazy read runs once its bytes have landed).
+	function readData(e, buf, offset, length, position, cb) {
+		const pos = (position === null || position === undefined) ? e.pos : position;
+		const avail = e.node.data.length - pos;
+		const n = Math.max(0, Math.min(length, avail));
+		if (n > 0) buf.set(e.node.data.subarray(pos, pos + n), offset);
+		if (position === null || position === undefined) e.pos += n;
+		queueMicrotask(() => cb(null, n));
 	}
 
 	['/bin', '/dev', '/etc', '/home/user', '/opt', '/proc', '/root', '/run', '/sys',
@@ -319,12 +347,23 @@
 				const e = fdEntry(fd);
 				if (e.node.dev) { queueMicrotask(() => cb(null, 0)); return; } // /dev/null
 				if (e.node.data === null) throw mkerr('EISDIR', 'read dir');
-				const pos = (position === null || position === undefined) ? e.pos : position;
-				const avail = e.node.data.length - pos;
-				const n = Math.max(0, Math.min(length, avail));
-				if (n > 0) buf.set(e.node.data.subarray(pos, pos + n), offset);
-				if (position === null || position === undefined) e.pos += n;
-				queueMicrotask(() => cb(null, n));
+				// A lazy file's bytes arrive on first read: fetch, populate, mark
+				// dirty so they persist, then serve this read and every later one
+				// from the now-resident data.
+				if (e.node.lazy) {
+					const lz = e.node.lazy;
+					fetch(lz.url).then((r) => {
+						if (!r.ok) throw new Error('lazy fetch ' + lz.url + ': ' + r.status);
+						return r.arrayBuffer();
+					}).then((ab) => {
+						e.node.data = new Uint8Array(ab);
+						e.node.lazy = null;
+						if (lazyDirtyHook) { try { lazyDirtyHook(); } catch (e2) { /* best-effort */ } }
+						readData(e, buf, offset, length, position, cb);
+					}).catch((err) => queueMicrotask(() => cb(err)));
+					return;
+				}
+				readData(e, buf, offset, length, position, cb);
 			} catch (err) { queueMicrotask(() => cb(err)); }
 		},
 
@@ -630,6 +669,7 @@
 						restored = true;
 					}
 					hookMutators();
+					lazyDirtyHook = markDirty; // a lazy read's populate persists
 					enabled = true;
 					if (typeof addEventListener === 'function') {
 						addEventListener('pagehide', () => { try { save(); } catch (e) { /* best-effort */ } });
@@ -661,6 +701,7 @@
 		stdio,           // swap .stdout/.stderr/.stdin to capture a command
 		mkdirp,          // host-side seeding helpers
 		writeFile: writeFileSeed,
+		writeLazy,       // seed a file fetched from a url on first read
 		readFile(path) { const r = resolve(path, true); if (!r.node || r.node.data === null) return null; return r.node.data; },
 		setCwd(d) { processImpl.chdir(d); },
 		pipe() { return makePipe(); },        // [readFd, writeFd]
