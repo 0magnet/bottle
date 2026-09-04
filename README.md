@@ -81,3 +81,37 @@ hypervisor UI from `http://127.0.0.1:8001` — all inside one tab.
 - [websh](https://github.com/0magnet/websh) and
   [tuiwasm](https://github.com/0magnet/tuiwasm) load the layer on their
   pages, so every wasm instance there shares one filesystem and localhost.
+
+## Dependency Graph
+
+Made with [goda](https://github.com/loov/goda):
+
+```
+# GOOS=js: the import edges of a wasm program live in js/wasm-tagged
+# files and are invisible to a host-context run
+GOOS=js GOARCH=wasm go run github.com/loov/goda@latest graph github.com/0magnet/bottle/... | dot -Tsvg -o docs/bottle-goda-graph.svg
+```
+
+![Dependency Graph](docs/bottle-goda-graph.svg "github.com/0magnet/bottle Dependency Graph")
+
+## Lines of Code
+
+Made with [gocloc](https://github.com/hhatto/gocloc) (excludes `vendor/`, `node_modules/`, `.git/`):
+
+```
+gocloc --not-match-d='(vendor|node_modules|\.git)' .
+```
+
+```
+-------------------------------------------------------------------------------
+Language                     files          blank        comment           code
+-------------------------------------------------------------------------------
+JavaScript                       4             86            288           1020
+Go                               6             60            122            398
+YAML                             1              0              7             98
+Markdown                         2             22              0             75
+HTML                             1              0              2             18
+-------------------------------------------------------------------------------
+TOTAL                           14            168            419           1609
+-------------------------------------------------------------------------------
+```
