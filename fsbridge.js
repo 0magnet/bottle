@@ -78,7 +78,8 @@
 		'link', 'truncate', 'ftruncate', 'chmod', 'fchmod', 'chown', 'fchown',
 		'lchown', 'utimes',
 	];
-	// Methods that return their value directly.
+	// Methods that return their value directly rather than through a callback.
+	// The client defines each one explicitly, since cwd is tracked per client.
 	const DIRECT_METHODS = ['getCwd', 'setCwd', 'chdir', 'mkdirp'];
 
 	const S_IFMT = 0o170000, S_IFDIR = 0o040000, S_IFREG = 0o100000;
@@ -86,6 +87,15 @@
 
 	// Marks the one argument carried in the binary tail instead of the JSON.
 	const BIN = { __bin: true };
+
+	// Which arguments of each method are paths, and so need absolutizing before
+	// they leave the client. symlink's first argument is the link TARGET, which
+	// is allowed to be relative and must be stored as written.
+	const PATH_ARGS = {
+		open: [0], stat: [0], lstat: [0], mkdir: [0], rmdir: [0], unlink: [0],
+		rename: [0, 1], readdir: [0], readlink: [0], symlink: [1], link: [0, 1],
+		truncate: [0], chmod: [0], chown: [0], lchown: [0], utimes: [0],
+	};
 
 	globalThis.fsbridge = {
 		installed: true,
@@ -192,8 +202,10 @@
 			const handle = async (req, inTail) => {
 				const m = req.m;
 				if (m === '__init') {
-					return { out: { v: { constants: owners[0].constants } } };
+					const g = lookup('getCwd');
+					return { out: { v: { constants: owners[0].constants, cwd: g ? g.getCwd() : '/' } } };
 				}
+				if (m === '__ping') return { out: { v: 1 } };
 				if (m === '__pull') {
 					const off = req.a[0];
 					return { out: { v: 1 }, tail: pendingOut.subarray(off) };
@@ -250,7 +262,8 @@
 		// client returns an fs-shaped object for a worker. Every call blocks
 		// until the owner answers, which is what makes it usable from a Go
 		// runtime that expects synchronous syscalls.
-		client(sab) {
+		client(sab, opts) {
+			opts = opts || {};
 			const ctl = new Int32Array(sab, 0, 8);
 			const bytes = new Uint8Array(sab, HEAD);
 			const CHUNK = bytes.length - 4096; // headroom for the JSON header
@@ -310,15 +323,56 @@
 			};
 
 			const init = raw('__init', [], null).v;
+
+			// Every path argument is made absolute HERE, on the client, because
+			// jsfs resolves relative paths against one module-global cwd. proc.js
+			// gets away with that on the main thread by swapping the cwd around
+			// each synchronous slice — correct only because nothing else can run.
+			// A worker runs concurrently, so a shared cwd would let one process's
+			// chdir silently change another's path resolution mid-call. Each
+			// client carries its own cwd and sends absolute paths, and the owner's
+			// cwd stops mattering.
+			let cwd = opts.cwd || init.cwd || '/';
+
+			const absPath = (p) => {
+				if (typeof p !== 'string') return p;
+				const joined = p.charAt(0) === '/' ? p : cwd + '/' + p;
+				const out = [];
+				for (const part of joined.split('/')) {
+					if (!part || part === '.') continue;
+					if (part === '..') { out.pop(); continue; }
+					out.push(part);
+				}
+				return '/' + out.join('/');
+			};
+			const fix = (m, args) => {
+				const idx = PATH_ARGS[m];
+				if (!idx) return args;
+				const a = args.slice();
+				for (const i of idx) a[i] = absPath(a[i]);
+				return a;
+			};
+
 			const shim = { __bridged: true, constants: init.constants };
 
-			for (const m of DIRECT_METHODS) {
-				shim[m] = function (...a) { return send(m, a, null).v; };
-			}
+			shim.getCwd = function () { return cwd; };
+			// chdir validates before committing, so a failed chdir leaves the
+			// process where it was rather than silently pointing at nothing.
+			const goTo = function (dir) {
+				const p = absPath(dir);
+				const st = send('stat', [p], null).v;
+				if (!st || (st.mode & 0o170000) !== 0o040000) {
+					throw Object.assign(new Error('ENOTDIR: ' + p), { code: 'ENOTDIR' });
+				}
+				cwd = p;
+			};
+			shim.chdir = goTo;
+			shim.setCwd = goTo;
+			shim.mkdirp = function (path, mode) { return send('mkdirp', [absPath(path), mode], null).v; };
 			shim.writeSync = function (fd, buf) { return send('writeSync', [fd, BIN], buf).v; };
-			shim.writeFile = function (path, data) { return send('writeFile', [path, BIN], data).v; };
+			shim.writeFile = function (path, data) { return send('writeFile', [absPath(path), BIN], data).v; };
 			shim.readFile = function (path) {
-				const r = send('readFile', [path], null);
+				const r = send('readFile', [absPath(path)], null);
 				if (!r.v) return null;
 				return recvTail(r);
 			};
@@ -328,7 +382,7 @@
 					const cb = args.pop();
 					let v;
 					try {
-						const r = send(m, args, null);
+						const r = send(m, fix(m, args), null);
 						v = r.v && r.v.__b ? recvTail(r) : reviveStat(r.v);
 					} catch (e) { queueMicrotask(() => cb(e)); return; }
 					// The microtask deferral is jsfs's contract, not an accident:
@@ -363,8 +417,8 @@
 		// here sees the same paths, the same cwd and the same bytes as its parent.
 		// stdio is deliberately absent: a worker child's streams are routed by
 		// proc.js, not by the filesystem bridge.
-		install(sab) {
-			const shim = globalThis.fsbridge.client(sab);
+		install(sab, opts) {
+			const shim = globalThis.fsbridge.client(sab, opts);
 			globalThis.fs = shim;
 			globalThis.jsfs = {
 				installed: true,
