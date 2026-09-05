@@ -118,7 +118,7 @@ func sinkFunc(w io.Writer) js.Func {
 		}
 		b := make([]byte, args[0].Get("length").Int())
 		js.CopyBytesToGo(b, args[0])
-		w.Write(b) //nolint:errcheck
+		w.Write(b) //nolint:errcheck,gosec // a sink that cannot accept output is the caller's problem, not the child's
 		return nil
 	})
 }
