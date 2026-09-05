@@ -193,7 +193,7 @@
 	}
 
 	// ---- pipes -------------------------------------------------------------
-	// os.Pipe / os/exec need pipes, which a wasm tab has no OS analogue for.
+	// os.Pipe / os/exec need pipes, which a wasm tab has no OS analog for.
 	// A pipe is a shared byte queue with a read end and a write end fd. Both
 	// ends live here in JS so a writer in one wasm instance and a reader in
 	// another meet in the page — never re-entering each other's Go runtime.

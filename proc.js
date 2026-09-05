@@ -2,7 +2,7 @@
 //
 // jsfs fakes the filesystem and vnet fakes the network; a Unix-shaped
 // orchestrator — a shell, `go build`, make — also needs fork/exec. A tab has
-// an exact analogue: instantiating another wasm module IS spawning a process.
+// an exact analog: instantiating another wasm module IS spawning a process.
 // proc makes that a primitive.
 //
 //   globalThis.proc.spawn({argv, env, cwd, stdout, stderr, stdin})
