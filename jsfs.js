@@ -387,7 +387,9 @@
 				if ((flags & constants.O_TRUNC) && node.data !== null) { node.data = new Uint8Array(0); node.mtimeMs = now(); }
 			}
 			const fd = nextFd++;
-			fds.set(fd, { node, pos: (flags & constants.O_APPEND) && node.data ? node.data.length : 0, flags });
+			// path is kept so persistence can tell whether a WRITE to this fd could
+			// change what a snapshot contains; see hookMutators.
+			fds.set(fd, { node, pos: (flags & constants.O_APPEND) && node.data ? node.data.length : 0, flags, path: normalize(path) });
 			return fd;
 		}),
 
@@ -636,9 +638,44 @@
 			timer = setTimeout(() => { timer = null; save(); }, wait);
 		}
 
+		// Which argument of each mutator names the path a snapshot would record.
+		// rename and link touch both ends, so either end being included is enough
+		// to dirty the tree; symlink's first argument is the link target, which is
+		// content rather than a location.
+		const PATH_ARGS = {
+			open: [0], mkdir: [0], rmdir: [0], unlink: [0], truncate: [0],
+			chmod: [0], chown: [0], lchown: [0], utimes: [0],
+			rename: [0, 1], link: [0, 1], symlink: [1],
+		};
+		const FD_ARGS = { ftruncate: [0], fchmod: [0], fchown: [0] };
+
+		function pathOfFd(fd) { const e = fds.get(fd); return e ? e.path : null; }
+
+		function isExcluded(p) {
+			if (!p || !excludeFn) return false;
+			try { return !!excludeFn(p); } catch (e) { return false; }
+		}
+
+		// snapshotUnaffected is true only when EVERY path a call touches is
+		// excluded. Anything unknown — a pipe fd, an unresolvable path, an
+		// exclude that throws — falls through to scheduling a snapshot, so the
+		// failure mode is a wasted copy rather than a lost write.
+		function snapshotUnaffected(paths) {
+			if (!paths || !paths.length) return false;
+			for (const p of paths) if (!isExcluded(p)) return false;
+			return true;
+		}
+
 		// Wrap the mutating syscalls once, at enable() time. write/writeSync
 		// only count for real files (fd > 2) — stdout/stderr traffic must not
 		// trigger snapshots.
+		//
+		// A write to an excluded path must not schedule one either. Excluding a
+		// path already keeps it OUT of the snapshot, so a write there cannot
+		// change what a snapshot contains — but without this check the exclude
+		// list only shrinks each snapshot, never reduces how many are taken, and
+		// a build writing thousands of cache files still queues a full-tree copy
+		// every couple of seconds.
 		function hookMutators() {
 			const names = ['open', 'mkdir', 'rmdir', 'rename', 'unlink', 'truncate',
 				'ftruncate', 'chmod', 'fchmod', 'chown', 'fchown', 'lchown', 'utimes',
@@ -646,12 +683,25 @@
 			for (const n of names) {
 				const orig = fsImpl[n];
 				if (typeof orig !== 'function') continue;
-				fsImpl[n] = function (...args) { markDirty(); return orig.apply(this, args); };
+				const pa = PATH_ARGS[n], fa = FD_ARGS[n];
+				fsImpl[n] = function (...args) {
+					let paths = null;
+					if (pa) paths = pa.map((i) => normalize(args[i]));
+					else if (fa) paths = fa.map((i) => pathOfFd(args[i]));
+					if (!snapshotUnaffected(paths)) markDirty();
+					return orig.apply(this, args);
+				};
 			}
 			const w = fsImpl.write;
-			fsImpl.write = function (fd, ...rest) { if (fd > 2) markDirty(); return w.call(this, fd, ...rest); };
+			fsImpl.write = function (fd, ...rest) {
+				if (fd > 2 && !isExcluded(pathOfFd(fd))) markDirty();
+				return w.call(this, fd, ...rest);
+			};
 			const ws = fsImpl.writeSync;
-			fsImpl.writeSync = function (fd, ...rest) { if (fd > 2) markDirty(); return ws.call(this, fd, ...rest); };
+			fsImpl.writeSync = function (fd, ...rest) {
+				if (fd > 2 && !isExcluded(pathOfFd(fd))) markDirty();
+				return ws.call(this, fd, ...rest);
+			};
 		}
 
 		return {
