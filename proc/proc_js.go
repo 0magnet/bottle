@@ -26,6 +26,31 @@ type Cmd struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	// OffThread runs the child in a Worker instead of on the page's one JS
+	// thread, so a long build does not freeze the tab. The child still sees
+	// this tab's filesystem -- it reaches jsfs over a blocking channel -- but
+	// not its vnet, and its stdin reads EOF. Suitable for compute like
+	// cmd/compile and cmd/link; not for a child that listens or dials.
+	//
+	// It needs cross-origin isolation, which is a property of how the page was
+	// served (COOP/COEP headers). Where that is missing, Run falls back to an
+	// on-thread child: same result, same output, just a busy main thread. Use
+	// OffThreadAvailable to find out which one you will get.
+	OffThread bool
+}
+
+// OffThreadAvailable reports whether OffThread children can actually run here:
+// proc.js and fsbridge.js are loaded and the page is cross-origin isolated.
+func OffThreadAvailable() bool {
+	proc := js.Global().Get("proc")
+	if !proc.Truthy() || !proc.Get("spawnWorker").Truthy() {
+		return false
+	}
+	if !js.Global().Get("fsbridge").Truthy() {
+		return false
+	}
+	return js.Global().Get("crossOriginIsolated").Truthy()
 }
 
 // Command builds a Cmd, mirroring os/exec.Command's shape.
@@ -72,7 +97,11 @@ func (c *Cmd) Run() (int, error) {
 		opts.Set("stdin", sourceFunc(c.Stdin))
 	}
 
-	res := proc.Call("spawn", opts)
+	method := "spawn"
+	if c.OffThread && OffThreadAvailable() {
+		method = "spawnWorker"
+	}
+	res := proc.Call(method, opts)
 	code, err := await(res.Get("exited"))
 	if err != nil {
 		return -1, err
