@@ -15,7 +15,7 @@ primitives: the filesystem, the network and the process layer.
 Big Go programs assume an operating system: a filesystem under `/`, config in
 `/etc`, localhost ports to listen on and dial. A browser tab has none of that,
 and Go's `wasm_exec.js` stubs it all with `ENOSYS`. bottle fills the gap with
-two page-global primitives:
+a few page-global primitives:
 
 - **`jsfs.js`** — an in-memory filesystem, laid out like a Linux root,
   installed as `globalThis.fs` / `globalThis.process` (the exact contract
@@ -33,6 +33,13 @@ two page-global primitives:
   makes that a primitive, the third leg under a Unix-shaped orchestrator
   (a shell, and eventually `go build`). The **`proc`** subpackage is its Go
   adapter (`proc.Command(...).Run()`, os/exec-shaped).
+- **`fsbridge.js`** — the same filesystem, reachable from a Worker.
+  `proc.spawnWorker` runs a child off the main thread, so a long compile no
+  longer freezes the tab, and several can run at once. jsfs stays on the thread
+  that owns it; the child blocks in `Atomics.wait` while the page answers,
+  which is the synchronous syscall contract Go's runtime requires. Needs
+  cross-origin isolation (COOP/COEP) for `SharedArrayBuffer`; without it
+  `spawnWorker` refuses and callers fall back to `proc.spawn`.
 
 The **`vnet`** Go subpackage is the adapter: `vnet.Listen` /
 `vnet.DialTimeout` are exactly `net.Listen` / `net.DialTimeout` on native
