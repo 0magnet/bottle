@@ -308,7 +308,6 @@
 		let exitCode = 0;
 		let crashed = false;
 		const exited = (async () => {
-			try {
 			// The Go loader and the program compile in parallel; both may be a
 			// network fetch on the first spawn.
 			const [, mod] = await Promise.all([ensureGo(), resolveModule(prog)]);
@@ -376,17 +375,14 @@
 				}
 			}
 			return exitCode;
-			} catch (e) {
-				// A failure to fetch, compile or instantiate never reaches the
-				// run phase's cleanup, so do it here: the ring must still record
-				// how this process ended, and nothing should be left registered.
-				crashed = true;
-				reap(id);
-				if (rec && !rec.exitInfo) rec.exitInfo = { code: exitCode || 1, crashed: true };
-				throw e;
-			}
-		})();
-
+		})().catch((e) => {
+			// A failure to fetch, compile or instantiate never reaches the run
+			// phase's cleanup, so do it here: the ring must still record how
+			// this process ended, and nothing should be left registered.
+			reap(id);
+			if (rec && !rec.exitInfo) rec.exitInfo = { code: exitCode || 1, crashed: true };
+			throw e;
+		});
 		return { pid, id, exited, kill: makeKill(id) };
 	}
 
