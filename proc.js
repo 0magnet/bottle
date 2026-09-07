@@ -237,7 +237,10 @@
 				const s = dec.decode(buf, { stream: true });
 				rec.tail = (rec.tail + s).slice(-limit);
 				if (filter) {
-					lineBuf += s;
+					// Capped the same as the ring: a program that writes a lot
+					// of stderr with no newline in it must not grow this without
+					// bound while it waits for one.
+					lineBuf = (lineBuf + s).slice(-limit);
 					let nl;
 					while ((nl = lineBuf.indexOf("\n")) >= 0) {
 						const line = lineBuf.slice(0, nl);
@@ -258,7 +261,13 @@
 		try { delete signals[id]; } catch (e) { /* ignore */ }
 		try {
 			const v = globalThis.vnet;
-			if (v && v.releaseOwner) return v.releaseOwner(id);
+			if (v && v.releaseOwner) {
+				const n = v.releaseOwner(id);
+				// Worth saying out loud: a program that exits still holding
+				// ports was killed, or crashed, or forgot to close them.
+				if (n > 0) console.warn("[proc " + id + "] released " + n + " vnet claim(s) on exit");
+				return n;
+			}
 		} catch (e) { /* ignore */ }
 		return 0;
 	}
