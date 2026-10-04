@@ -395,10 +395,13 @@
 		// WebSocket's interface. A service worker cannot carry WebSockets, so
 		// pages served under the vnet scope reach their server through this
 		// (vnet-sw.js injects a WebSocket shim that calls it).
-		webSocket(port, path, protocols, url) {
+		webSocket(port, path, protocols, url, realm) {
 			const v = this;
+			// Events and message data are made in the caller's realm (its window),
+			// so an iframe's `data instanceof ArrayBuffer` holds.
+			const R = realm || globalThis;
 			const te = new TextEncoder(), td = new TextDecoder();
-			const ws = new EventTarget();
+			const ws = new R.EventTarget();
 			const origin = typeof location !== 'undefined' ? location.origin : 'null';
 			ws.url = url || ('ws://127.0.0.1:' + port + (path || '/'));
 			ws.readyState = 0;
@@ -410,9 +413,9 @@
 			ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
 			const fire = (type, init) => {
 				let ev;
-				if (type === 'message') ev = new MessageEvent('message', init);
-				else if (type === 'close') ev = new CloseEvent('close', init);
-				else ev = new Event(type);
+				if (type === 'message') ev = new R.MessageEvent('message', init);
+				else if (type === 'close') ev = new R.CloseEvent('close', init);
+				else ev = new R.Event(type);
 				const h = ws['on' + type];
 				if (typeof h === 'function') { try { h.call(ws, ev); } catch (e) { setTimeout(() => { throw e; }); } }
 				ws.dispatchEvent(ev);
@@ -475,8 +478,9 @@
 			const append = (b) => { const n = new Uint8Array(buf.length + b.length); n.set(buf); n.set(b, buf.length); buf = n; };
 			const deliver = (op, payload) => {
 				if (op === 1) { fire('message', { data: td.decode(payload), origin: origin }); return; }
-				const ab = payload.slice().buffer;
-				fire('message', { data: ws.binaryType === 'arraybuffer' ? ab : new Blob([ab]), origin: origin });
+				const u = new R.Uint8Array(payload.length);
+				u.set(payload);
+				fire('message', { data: ws.binaryType === 'arraybuffer' ? u.buffer : new R.Blob([u]), origin: origin });
 			};
 			const drain = () => {
 				if (ws.readyState === 0) {

@@ -119,7 +119,7 @@ function wsShim(P) {
 			var x = new URL(u, location.href);
 			if (x.host === location.host && x.pathname.indexOf(P) === 0) {
 				var r = x.pathname.slice(P.length).match(/^(\d+)(\/.*)?$/);
-				if (r) return h.webSocket(+r[1], (r[2] || '/') + x.search, p, x.href);
+				if (r) return h.webSocket(+r[1], (r[2] || '/') + x.search, p, x.href, window);
 			}
 			return p === undefined ? new N(u) : new N(u, p);
 		};
