@@ -370,6 +370,9 @@
 				+ (globalThis.crossOriginIsolated ? '&coi=1' : '')
 				+ (timeoutMs > 0 ? '&timeout=' + Math.round(timeoutMs) : '');
 			return navigator.serviceWorker.register(url, { scope: prefix })
+				// Registering an unchanged URL does not check for a new worker, so a
+				// deployed vnet-sw.js would wait for the browser's own schedule.
+				.then((reg) => { reg.update().catch(() => {}); return reg; })
 				.then((reg) => new Promise((resolve) => {
 					// Wait on THIS registration's worker reaching 'activated'.
 					// (navigator.serviceWorker.ready is the wrong wait here: it
