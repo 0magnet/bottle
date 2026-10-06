@@ -60,7 +60,7 @@ setTimeout(() => { console.log('stalled:' + seen.join(',')); process.exit(1); },
 	if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(node, f, src).CombinedOutput()
+	out, err := exec.Command(node, f, src).CombinedOutput() //nolint:gosec
 	if err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
