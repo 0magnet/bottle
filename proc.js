@@ -183,6 +183,12 @@
 		return null;
 	}
 
+	// setCwd enters a directory a process holds. A process may remove its own
+	// working directory, which jsfs cannot enter, so that slice keeps the old one.
+	function setCwd(d) {
+		try { jsfs.setCwd(d); } catch (e) { /* removed since */ }
+	}
+
 	function join(a, b) {
 		if (b.startsWith("/")) return b;
 		return (a.endsWith("/") ? a : a + "/") + b;
@@ -277,7 +283,7 @@
 		opts = opts || {};
 		const argv = opts.argv || [];
 		if (!argv.length) throw new Error("proc.spawn: empty argv");
-		const cwd = opts.cwd || jsfs.getCwd();
+		let cwd = opts.cwd || jsfs.getCwd();
 		const env = opts.env || {};
 
 		const prog = readProgram(argv[0], cwd, env);
@@ -321,41 +327,57 @@
 			for (const k of idEnvNames(opts)) go.env[k] = id;
 			go.exit = (c) => { exitCode = c; };
 
+			// enter and leave bracket one execution slice. The process gets its
+			// stdio and directory, the caller gets its own back, and a chdir sticks.
+			const enter = () => {
+				const t = { active, cwd: jsfs.getCwd() };
+				active = myStdio;
+				setCwd(cwd);
+				t.entered = jsfs.getCwd();
+				return t;
+			};
+			const leave = (t) => {
+				const now = jsfs.getCwd();
+				if (now !== t.entered) cwd = now;
+				active = t.active;
+				setCwd(t.cwd);
+			};
+
 			// Wrap _resume so this process's stdio is the active set for the
 			// exact span of each synchronous execution slice, then restored.
 			// Covers the initial run and every timer/promise-driven re-entry.
-			const rawResume = go._resume.bind(go);
-			go._resume = function () {
-				// A child's Go runtime schedules timer callbacks (sysmon, the
-				// scheduler); one can fire AFTER the program exits, and stock
-				// wasm_exec throws "already exited" from _resume, uncaught,
-				// which would take the page down. Swallow those late resumes.
-				if (go.exited) return;
-				const prev = active;
-				active = myStdio;
-				const prevCwd = jsfs.getCwd();
-				jsfs.setCwd(cwd); // each process has its own working directory
-				try {
-					return rawResume();
-				} finally {
-					active = prev;
-					jsfs.setCwd(prevCwd);
-				}
-			};
+			// TinyGo's loader runs a timer wakeup through _wake rather than
+			// _resume, so that entry gets the same wrapper.
+			for (const name of ["_resume", "_wake"]) {
+				if (typeof go[name] !== "function") continue;
+				const raw = go[name].bind(go);
+				go[name] = function () {
+					// A child's Go runtime schedules timer callbacks (sysmon, the
+					// scheduler); one can fire AFTER the program exits, and stock
+					// wasm_exec throws "already exited" from _resume, uncaught,
+					// which would take the page down. Swallow those late resumes.
+					if (go.exited) return;
+					const t = enter();
+					try {
+						return raw();
+					} finally {
+						leave(t);
+					}
+				};
+			}
 
 			const inst = await WebAssembly.instantiate(mod, go.importObject);
-			const prev = active;
-			active = myStdio;
-			const prevCwd = jsfs.getCwd();
-			jsfs.setCwd(cwd);
+			// run executes the first slice before it returns its promise, so the
+			// page's stdio and directory come back as soon as that slice ends.
+			const t = enter();
+			let running;
+			try { running = go.run(inst); } finally { leave(t); }
 			try {
-				await go.run(inst); // resolves when the program exits
+				await running; // resolves when the program exits
 			} catch (e) {
 				crashed = true;
 				throw e;
 			} finally {
-				active = prev;
-				jsfs.setCwd(prevCwd);
 				reap(id);
 				if (rec) rec.exitInfo = { code: exitCode, crashed: crashed };
 				// Cancel any timer callbacks the child's Go runtime still had
