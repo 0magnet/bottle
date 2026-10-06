@@ -76,6 +76,11 @@ Hand a subtree to another filesystem, such as a remote one, with
 prefix with node-style callbacks, whenever it is ready; `jsfs.js` documents
 them where the mount layer is defined. `jsfs.unmount(prefix)` detaches it.
 
+`jsfs.sync` has the same fs methods without callbacks. Each returns its result
+or throws an error with a `.code`, for a loader that cannot wait, such as
+TinyGo's, whose WASI filesystem calls are synchronous. Mounted paths answer
+`ENOTSUP` there, and a lazy file answers `EAGAIN` until its bytes arrive.
+
 And in the program, listen/dial loopback through the adapter:
 
 ```go
