@@ -834,14 +834,40 @@
 			return out;
 		}
 
+		// applySnapshot replaces what the snapshot covers. What it does not
+		// cover — excluded paths, mounts — is left as THIS load made it: a
+		// fresh, empty /tmp, new /dev devices, the page's own seeded files.
+		// Nothing of the last session comes back outside the snapshot. Clearing
+		// the whole root instead left a page that persisted only part of the
+		// tree with no /tmp and no /dev at all. (A page that excludes nothing
+		// snapshots /tmp and /dev too, and gets the old ones back: exclude
+		// them unless that is what it wants.)
 		function applySnapshot(entries) {
-			root.entries.clear();
+			(function prune(node, path) {
+				for (const [name, child] of [...node.entries]) {
+					const p = path + '/' + name;
+					if (isExcluded(p)) continue;
+					if ((child.mode & 0o170000) === S_IFDIR) {
+						prune(child, p);
+						if (child.entries.size === 0) node.entries.delete(name);
+					} else {
+						node.entries.delete(name);
+					}
+				}
+			})(root, '');
 			for (const e of entries) {
 				// serialize() emits parents before children, so the parent dir
 				// always exists by the time its entries arrive.
 				const slash = e.p.lastIndexOf('/');
 				const parent = slash === 0 ? root : resolve(e.p.slice(0, slash), true).node;
 				const name = e.p.slice(slash + 1);
+				const have = parent.entries.get(name);
+				if (e.t === 'd' && have && (have.mode & 0o170000) === S_IFDIR) {
+					// kept by prune for what is excluded inside it
+					have.mode = S_IFDIR | (e.m & 0o7777);
+					have.mtimeMs = e.mt || now();
+					continue;
+				}
 				let node;
 				switch (e.t) {
 				case 'd': node = mknode(S_IFDIR, e.m); break;
