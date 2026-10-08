@@ -3,24 +3,38 @@
 package proc
 
 import (
+	"errors"
+	"io"
 	"os"
 	"syscall/js"
 )
 
 // Terminal is a child's own terminal, when its parent started it with a TTY:
-// the size to draw at, raw mode, and word of resizes. Its stdin and stdout are
-// the terminal's keys and screen, as on any Unix.
+// the size to draw at, raw mode, and word of resizes. Reading it is reading
+// the keys typed, and writing it is drawing on the screen, as stdin and stdout
+// are on any Unix. Use it for both when the program may be built by stock
+// TinyGo, whose os.Stdin cannot read.
 type Terminal struct {
 	v      js.Value
 	resize []js.Func
 }
 
 // Term returns this program's terminal, or false when it has none: it was
-// not spawned by proc, or was spawned without a TTY.
+// not spawned by proc, or was spawned without a TTY. Call it from main's
+// goroutine before anything else runs, where a program that was handed no
+// environment is still found by the process it is.
 func Term() (*Terminal, bool) {
 	proc := js.Global().Get("proc")
+	if !proc.Truthy() || !proc.Get("tty").Truthy() {
+		return nil, false
+	}
 	id := os.Getenv("BOTTLE_PID")
-	if !proc.Truthy() || !proc.Get("tty").Truthy() || id == "" {
+	if id == "" && proc.Get("self").Truthy() {
+		if v := proc.Call("self"); v.Truthy() {
+			id = v.String()
+		}
+	}
+	if id == "" {
 		return nil, false
 	}
 	v := proc.Call("tty", id)
@@ -54,4 +68,48 @@ func (t *Terminal) OnResize(f func(cols, rows int)) {
 	})
 	t.resize = append(t.resize, jf)
 	t.v.Call("onResize", jf)
+}
+
+// Read waits for keys and returns them; 0 and io.EOF at the end of the input.
+func (t *Terminal) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	buf := js.Global().Get("Uint8Array").New(len(p))
+	type res struct {
+		n   int
+		err error
+	}
+	ch := make(chan res, 1)
+	cb := js.FuncOf(func(_ js.Value, args []js.Value) any {
+		if len(args) > 0 && args[0].Truthy() {
+			ch <- res{err: errors.New(args[0].Get("message").String())}
+			return nil
+		}
+		n := 0
+		if len(args) > 1 {
+			n = args[1].Int()
+		}
+		ch <- res{n: n}
+		return nil
+	})
+	defer cb.Release()
+	t.v.Call("read", buf, cb)
+	r := <-ch
+	if r.err != nil {
+		return 0, r.err
+	}
+	if r.n == 0 {
+		return 0, io.EOF
+	}
+	js.CopyBytesToGo(p[:r.n], buf.Call("subarray", 0, r.n))
+	return r.n, nil
+}
+
+// Write draws p on the terminal.
+func (t *Terminal) Write(p []byte) (int, error) {
+	buf := js.Global().Get("Uint8Array").New(len(p))
+	js.CopyBytesToJS(buf, p)
+	t.v.Call("write", buf)
+	return len(p), nil
 }

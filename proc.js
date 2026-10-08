@@ -38,6 +38,8 @@
 // Requires jsfs.js (globalThis.fs, jsfs.stdio). Go's wasm_exec.js may be
 // loaded ahead of proc.js or left to the first spawn, which fetches
 // proc.assets.wasmExec — importScripts in a worker, a <script> in a page.
+// A program TinyGo built runs under TinyGo's loader, proc.assets.wasmExecTinyGo,
+// and either kind runs on a page built with the other.
 (function () {
 	if (globalThis.proc && globalThis.proc.installed) return;
 	if (!globalThis.fs || !globalThis.jsfs) throw new Error("proc.js: load jsfs.js first");
@@ -144,16 +146,39 @@
 		return true;
 	}
 
-	// ensureGo loads Go's wasm_exec.js if the page has not. Lazy because the
-	// loader is only needed once a program actually runs, and realm-aware: a
-	// worker has no document to append a <script> to, and importScripts is not
-	// defined in a page.
-	let goLoader = null;
-	function ensureGo() {
-		if (typeof globalThis.Go === "function") return Promise.resolve();
-		if (!goLoader) {
-			const url = assets.wasmExec;
-			goLoader = (typeof importScripts === "function"
+	// A program is run by the loader of the toolchain that built it: Go's
+	// wasm_exec.js or TinyGo's, which import different functions and both name
+	// their class globalThis.Go. A page built with one can run children built
+	// with either: the page's own class serves its kind, and the other is
+	// loaded on first need from proc.assets — wasmExecGo or wasmExecTinyGo —
+	// taken from globalThis without replacing the page's.
+
+	// kindOf tells a TinyGo module (it imports WASI) from a Go one.
+	function kindOf(mod) {
+		try {
+			return WebAssembly.Module.imports(mod).some((i) => i.module === "wasi_snapshot_preview1") ? "tinygo" : "go";
+		} catch (e) { return "go"; }
+	}
+
+	// classKind tells which toolchain a loader class serves, by the imports it offers.
+	function classKind(cls) {
+		try { return new cls().importObject.wasi_snapshot_preview1 ? "tinygo" : "go"; } catch (e) { return "go"; }
+	}
+
+	const goClasses = Object.create(null); // kind -> Promise<class>
+	let loading = Promise.resolve(); // one loader script at a time: each sets globalThis.Go
+
+	// goClass resolves the loader class for kind. Lazy because a loader is only
+	// needed once a program of its kind runs, and realm-aware: a worker has no
+	// document to append a <script> to, and importScripts is not defined in a page.
+	function goClass(kind) {
+		const page = typeof globalThis.Go === "function" ? globalThis.Go : null;
+		if (page && classKind(page) === kind) return Promise.resolve(page);
+		if (goClasses[kind]) return goClasses[kind];
+		const url = kind === "tinygo" ? assets.wasmExecTinyGo : (assets.wasmExecGo || assets.wasmExec);
+		const p = loading.then(() => {
+			const before = globalThis.Go;
+			return (typeof importScripts === "function"
 				? new Promise((res) => { importScripts(url); res(); })
 				: new Promise((res, rej) => {
 					const s = document.createElement("script");
@@ -163,10 +188,16 @@
 					document.head.appendChild(s);
 				})
 			).then(() => {
-				if (typeof globalThis.Go !== "function") throw new Error(url + " loaded but defines no Go class");
-			}).catch((e) => { goLoader = null; throw e; });
-		}
-		return goLoader;
+				const cls = globalThis.Go;
+				if (before) globalThis.Go = before; // the page keeps its own
+				if (typeof cls !== "function" || cls === before) throw new Error(url + " loaded but defines no Go class");
+				if (classKind(cls) !== kind) throw new Error(url + " is not a " + kind + " loader");
+				return cls;
+			});
+		});
+		loading = p.catch(() => {});
+		goClasses[kind] = p.catch((e) => { delete goClasses[kind]; throw e; });
+		return goClasses[kind];
 	}
 
 	function readProgram(argv0, cwd, env) {
@@ -259,7 +290,11 @@
 	// parent's onRaw is usually a Go function in the PARENT's runtime, and a
 	// resize listener is one in the CHILD's; called inline, either would run a
 	// second Go runtime on top of the first one's stack (see deliver).
-	function makeTTY(o) {
+	//
+	// The terminal also carries the process's own keys and screen — read waits
+	// on its stdin pipe, write goes to its stdout sink — so a program that has
+	// no working os.Stdin, such as one stock TinyGo built, still has a tty.
+	function makeTTY(o, io) {
 		const t = {
 			cols: Math.max(1, o.cols | 0) || 80,
 			rows: Math.max(1, o.rows | 0) || 24,
@@ -278,6 +313,13 @@
 				if (f) queueMicrotask(() => { try { f(on); } catch (e) { /* parent gone */ } });
 			},
 			onResize(fn) { if (typeof fn === "function") t.listeners.push(fn); },
+			// read(buf, cb) fills buf with what is typed, waiting for it, and
+			// calls cb(err, n); n is 0 at the end of the input.
+			read(buf, cb) {
+				if (io.stdinPipe < 0 || !jsfs.isPipe(io.stdinPipe)) { queueMicrotask(() => cb(null, 0)); return; }
+				globalThis.fs.read(io.stdinPipe, buf, 0, buf.length, null, cb);
+			},
+			write(buf) { deliver(io.stdout, buf); return buf.length; },
 		};
 		return t;
 	}
@@ -295,6 +337,12 @@
 			queueMicrotask(() => { if (ttys[id] === t) { try { fn(cols, rows); } catch (e) { /* child gone */ } } });
 		}
 		return true;
+	}
+
+	// self is the id of the process whose slice is running, or null on the
+	// page's own time: how a child that was handed no environment finds itself.
+	function self() {
+		return active && active.id ? active.id : null;
 	}
 
 	// ttyOf is the child's side: its terminal, or null when it has none.
@@ -388,9 +436,10 @@
 			stderr: opts.stderr || pageDefaults.stderr,
 			stdin: typeof opts.stdin === "function" ? opts.stdin : pageDefaults.stdin,
 			stdinPipe: stdinR,
+			id,
 		};
 		if (rec) myStdio.stderr = tailSink(rec, myStdio.stderr, opts.tail, opts.tailFilter || null);
-		if (opts.tty) ttys[id] = makeTTY(opts.tty);
+		if (opts.tty) ttys[id] = makeTTY(opts.tty, myStdio);
 
 		let exitCode = 0;
 		let crashed = false;
@@ -408,7 +457,8 @@
 		const exited = (async () => {
 			// The Go loader and the program compile in parallel; both may be a
 			// network fetch on the first spawn.
-			const [, mod] = await Promise.all([ensureGo(), resolveModule(prog)]);
+			const mod = await resolveModule(prog);
+			const Go = await goClass(kindOf(mod));
 			if (cancelled) return 130;
 
 			const go = new Go();
@@ -418,7 +468,28 @@
 			// It is the key it registers its interrupt handler under and the
 			// owner tag its vnet claims carry, so kill() and reap() find them.
 			for (const k of idEnvNames(opts)) go.env[k] = id;
-			go.exit = (c) => { exitCode = c; };
+			let exitHooked = false;
+			go.exit = (c) => { exitCode = c; exitHooked = true; };
+			// Stock TinyGo writes fds 1 and 2 through WASI straight to the console,
+			// past jsfs and so past this process's sinks. Send them through jsfs.
+			let memory = null;
+			const wasi = go.importObject.wasi_snapshot_preview1;
+			if (wasi && wasi.fd_write) {
+				const raw = wasi.fd_write;
+				wasi.fd_write = function (fd, iovs, n, nwritten) {
+					if ((fd !== 1 && fd !== 2) || !memory) return raw.apply(this, arguments);
+					const dv = new DataView(memory.buffer);
+					let total = 0;
+					for (let i = 0; i < n; i++) {
+						const p = dv.getUint32((iovs >>> 0) + i * 8, true);
+						const len = dv.getUint32((iovs >>> 0) + i * 8 + 4, true);
+						if (len) globalThis.fs.writeSync(fd, new Uint8Array(memory.buffer, p, len));
+						total += len;
+					}
+					dv.setUint32(nwritten >>> 0, total, true);
+					return 0;
+				};
+			}
 
 			// enter and leave bracket one execution slice. The process gets its
 			// stdio and directory, the caller gets its own back, and a chdir sticks.
@@ -459,8 +530,24 @@
 				};
 			}
 
-			const inst = await WebAssembly.instantiate(mod, go.importObject);
+			const real = await WebAssembly.instantiate(mod, go.importObject);
+			memory = real.exports.memory || real.exports.mem || null;
 			if (cancelled) return 130;
+			// TinyGo's loader runs a timer wakeup by calling the instance's
+			// go_scheduler export straight from setTimeout, past every wrapper on
+			// go. Hand run an instance whose export is wrapped too: one whose
+			// prototype is the real one, so it is still a WebAssembly.Instance.
+			let inst = real;
+			if (typeof real.exports.go_scheduler === "function") {
+				const ex = Object.assign({}, real.exports);
+				const raw = real.exports.go_scheduler;
+				ex.go_scheduler = function () {
+					if (go.exited) return;
+					const t = enter();
+					try { return raw(); } finally { leave(t); }
+				};
+				inst = Object.create(real, { exports: { value: ex } });
+			}
 			// A hard kill marks the program exited — the _resume guard above then
 			// turns every later callback into it into a no-op — cancels its
 			// timers, and ends the wait for it. Called from the caller's stack,
@@ -479,7 +566,10 @@
 			let running;
 			try { running = go.run(inst); } finally { leave(t); }
 			try {
-				await Promise.race([running, killed]); // the program exits, or is killed
+				// The program exits, or is killed. TinyGo's loader reports the
+				// exit code as run's result rather than through go.exit.
+				const ran = await Promise.race([running.then((c) => ({ c })), killed.then(() => null)]);
+				if (ran && typeof ran.c === "number" && !exitHooked) exitCode = ran.c;
 			} catch (e) {
 				crashed = true;
 				throw e;
@@ -631,7 +721,14 @@
 	const BASE = (typeof document !== 'undefined' && document.currentScript && document.currentScript.src)
 		? document.currentScript.src.replace(/[^/]*$/, '')
 		: (globalThis.location ? globalThis.location.origin + '/' : '/');
-	const assets = { fsbridge: BASE + 'fsbridge.js', wasmExec: BASE + 'wasm_exec.js' };
+	// wasmExec is Go's loader, for a page that has none yet; wasmExecGo, when
+	// set, takes its place, and wasmExecTinyGo is TinyGo's.
+	const assets = {
+		fsbridge: BASE + 'fsbridge.js',
+		wasmExec: BASE + 'wasm_exec.js',
+		wasmExecGo: '',
+		wasmExecTinyGo: BASE + 'wasm_exec_tinygo.js',
+	};
 
 	const WORKER_SRC = `
 self.onmessage = async (ev) => {
@@ -769,7 +866,9 @@ self.onmessage = async (ev) => {
 		(async () => {
 			try {
 				const mod = await resolveModule(prog);
-				w.postMessage({ sab, mod, argv: argv.slice(), env, cwd, assets });
+				const kind = kindOf(mod);
+				const loader = kind === 'tinygo' ? assets.wasmExecTinyGo : (assets.wasmExecGo || assets.wasmExec);
+				w.postMessage({ sab, mod, argv: argv.slice(), env, cwd, assets: Object.assign({}, assets, { wasmExec: loader }) });
 			} catch (e) {
 				myStdio.stderr(new TextEncoder().encode('proc: ' + ((e && e.message) || e) + '\n'));
 				w.dispatchEvent(new ErrorEvent('error', { message: String((e && e.message) || e) }));
@@ -782,7 +881,7 @@ self.onmessage = async (ev) => {
 	globalThis.proc = {
 		installed: true,
 		spawn, spawnWorker, pipeSink, pipeSource, assets,
-		resize, tty: ttyOf,
+		resize, tty: ttyOf, self,
 		registerModule, registerURL, compileURL,
 		// The two page-lifetime registries. Exposed so a page can name them
 		// under its own globals (a child's Go signal handler registers into

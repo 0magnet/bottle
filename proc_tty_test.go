@@ -15,6 +15,9 @@ const nodefs = require('fs');
 const ENV = process.env;
 const CHILD = new Uint8Array(nodefs.readFileSync(ENV.CHILD_WASM));
 const PARENT = ENV.PARENT_WASM ? new Uint8Array(nodefs.readFileSync(ENV.PARENT_WASM)) : null;
+const TINY = ENV.TINY_WASM ? new Uint8Array(nodefs.readFileSync(ENV.TINY_WASM)) : null;
+const TINY_EXEC = ENV.TINY_EXEC;
+const vm = require('vm');
 `
 
 // procTTYScript drives a terminal child through proc.js as a shell would:
@@ -67,6 +70,23 @@ const start = (o) => {
 	// no tty
 	h = start({ tty: undefined });
 	results.push('notty=' + await h.p.exited);
+
+	// built by TinyGo, on a page whose loader is Go's: its own loader is
+	// fetched for it, and the page keeps Go's
+	if (TINY) {
+		proc.assets.wasmExecTinyGo = TINY_EXEC;
+		globalThis.importScripts = (u) => vm.runInThisContext(nodefs.readFileSync(u, 'utf8'));
+		const pageGo = globalThis.Go;
+		h = start({ bytes: TINY });
+		await waitFor(h, 'ready 80x24\n');
+		h.p.stdin.write(te.encode('tiny\n'));
+		await waitFor(h, 'got tiny\n');
+		h.p.resize(90, 20);
+		await waitFor(h, 'resized 90x20\n');
+		h.p.stdin.write(te.encode('q\n'));
+		results.push('tinygo=' + await h.p.exited + ' raws=' + h.raws.join(',') + ' pageGo=' + (globalThis.Go === pageGo));
+		delete globalThis.importScripts;
+	}
 	console.log(results.join('\n'));
 
 	if (PARENT) {
@@ -97,6 +117,18 @@ func TestProcTTY(t *testing.T) {
 		return out
 	}
 	child, parent := build("ttychild"), build("ttyparent")
+	var tiny, tinyExec string
+	if tg, err := exec.LookPath("tinygo"); err == nil && !testing.Short() {
+		tiny = filepath.Join(dir, "tiny.wasm")
+		if b, err := exec.Command(tg, "build", "-o", tiny, "-target", "wasm", "-no-debug", "./testdata/ttychild").CombinedOutput(); err != nil { //nolint:gosec // a fixed package of this repo
+			t.Fatalf("tinygo build: %v\n%s", err, b)
+		}
+		root, err := exec.Command(tg, "env", "TINYGOROOT").Output() //nolint:gosec // the toolchain found above
+		if err != nil {
+			t.Fatal(err)
+		}
+		tinyExec = filepath.Join(strings.TrimSpace(string(root)), "targets", "wasm_exec.js")
+	}
 	root, err := exec.Command("go", "env", "GOROOT").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -114,20 +146,25 @@ func TestProcTTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(node, script) //nolint:gosec // the script this test wrote
-	cmd.Env = append(os.Environ(), "CHILD_WASM="+child, "PARENT_WASM="+parent)
+	cmd.Env = append(os.Environ(), "CHILD_WASM="+child, "PARENT_WASM="+parent, "TINY_WASM="+tiny, "TINY_EXEC="+tinyExec)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node: %v\n%s", err, out)
 	}
-	want := strings.Join([]string{
+	want := []string{
 		`q=4 raws=true,false after=false`,
 		`eof=5 "got x|eof|"`,
 		`kill=true code=130 again=false tty=null resize=false`,
 		`notty=2`,
+	}
+	if tiny != "" {
+		want = append(want, `tinygo=4 raws=true,false pageGo=true`)
+	}
+	want = append(want,
 		`run code=4 err=<nil> out="ready 40x10\ngot a\n" raws=[true false]`,
 		`kill=true`,
 		`killed code=130 err=<nil> write=io: read/write on closed pipe`,
-	}, "\n")
+	)
 	// node's console.log ends each of the parent's writes with a newline of
 	// its own.
 	var lines []string
@@ -136,7 +173,7 @@ func TestProcTTY(t *testing.T) {
 			lines = append(lines, l)
 		}
 	}
-	if got := strings.Join(lines, "\n"); got != want {
+	if got, want := strings.Join(lines, "\n"), strings.Join(want, "\n"); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
 }
