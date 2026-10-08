@@ -32,6 +32,13 @@ type Cmd struct {
 	// TTY, if set, gives the child a terminal; see TTY.
 	TTY *TTY
 
+	// Program, if set, is the program itself, for one kept somewhere other
+	// than the page filesystem; Path then only names it. With Stamp, it is
+	// compiled once and kept for as long as Path's Stamp stays the same, and
+	// Cached says when it need not be read at all.
+	Program []byte
+	Stamp   string
+
 	stdin *stdinPipe
 
 	// OffThread runs the child in a Worker instead of on the page's one JS
@@ -58,6 +65,13 @@ func OffThreadAvailable() bool {
 		return false
 	}
 	return js.Global().Get("crossOriginIsolated").Truthy()
+}
+
+// Cached reports whether the program at path, as of stamp, is compiled and
+// kept, so a Cmd with that Path and Stamp needs no Program.
+func Cached(path, stamp string) bool {
+	proc := js.Global().Get("proc")
+	return proc.Truthy() && proc.Get("cached").Truthy() && proc.Call("cached", path, stamp).Truthy()
 }
 
 // Command builds a Cmd, mirroring os/exec.Command's shape.
@@ -133,6 +147,14 @@ func (c *Cmd) Start() (*Process, error) {
 		}
 	}
 	opts.Set("env", env)
+	if c.Stamp != "" {
+		opts.Set("stamp", c.Stamp)
+	}
+	if c.Program != nil {
+		u := js.Global().Get("Uint8Array").New(len(c.Program))
+		js.CopyBytesToJS(u, c.Program)
+		opts.Set("bytes", u)
+	}
 
 	if c.Stdout != nil {
 		opts.Set("stdout", fn(p.out.sink(c.Stdout)))

@@ -54,12 +54,17 @@ const start = (o) => {
 	h.p.stdin.write(te.encode('q\n'));
 	results.push('q=' + await h.p.exited + ' raws=' + h.raws.join(',') + ' after=' + h.p.stdin.write(te.encode('x')));
 
-	// the end of its input
-	h = start({ bytes: CHILD, argv: ['/nowhere/child'] });
+	// the end of its input, from a program kept outside jsfs
+	h = start({ bytes: CHILD, stamp: 'v1', argv: ['/nowhere/child'] });
 	await waitFor(h, 'ready');
 	h.p.stdin.write(te.encode('x\n'));
 	h.p.stdin.close();
 	results.push('eof=' + await h.p.exited + ' ' + JSON.stringify(h.text.split('\n').slice(1).join('|')));
+
+	// kept by its stamp: run again with no bytes, and not once it changed
+	results.push('cached=' + proc.cached('/nowhere/child', 'v1') + ',' + proc.cached('/nowhere/child', 'v2'));
+	h = start({ stamp: 'v1', argv: ['/nowhere/child'], stdin: undefined });
+	results.push('again=' + await h.p.exited);
 
 	// killed while it waits on its stdin
 	h = start({});
@@ -154,6 +159,8 @@ func TestProcTTY(t *testing.T) {
 	want := []string{
 		`q=4 raws=true,false after=false`,
 		`eof=5 "got x|eof|"`,
+		`cached=true,false`,
+		`again=5`,
 		`kill=true code=130 again=false tty=null resize=false`,
 		`notty=2`,
 	}

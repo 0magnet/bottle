@@ -12,7 +12,9 @@
 //   the file's bytes ARE the program. Compiled modules are cached by path so
 //   repeat spawns skip the compile. A program too big to hold as bytes is
 //   bound to its path with registerModule / registerURL instead, and a caller
-//   that keeps programs elsewhere passes opts.bytes or opts.module.
+//   that keeps programs elsewhere passes opts.bytes or opts.module. Bytes
+//   with opts.stamp are compiled once per path and stamp: proc.cached(path,
+//   stamp) says when a spawn needs no bytes at all.
 // - The child shares globalThis.fs (jsfs) and globalThis.vnet — that sharing
 //   is the whole point: a parent writes $WORK, the child compiler reads it.
 //   When it exits, the vnet claims it could not unlisten are released for it.
@@ -407,9 +409,7 @@
 		let cwd = opts.cwd || jsfs.getCwd();
 		const env = opts.env || {};
 
-		const prog = opts.module ? { path: argv[0], module: opts.module }
-			: opts.bytes ? { path: argv[0], bytes: opts.bytes, uncached: true }
-			: readProgram(argv[0], cwd, env);
+		const prog = programOf(opts, argv[0], cwd, env);
 		const pid = nextPID++;
 		const id = opts.id || ("p" + pid);
 		if (!prog) {
@@ -657,9 +657,35 @@
 
 	// resolveModule turns a resolved program into a compiled module: the cache
 	// first, then a registered URL loader, then the bytes from jsfs.
+	// Programs a caller keeps outside jsfs, compiled and kept by path for as
+	// long as their stamp (whatever tells one version from the next: a size and
+	// a time, say) stays the same. path -> { stamp, mod }
+	const stamped = new Map();
+
+	// cached reports whether path's program, as of stamp, is compiled and
+	// kept, so a caller can spawn it with no bytes at all.
+	function cached(path, stamp) {
+		const e = stamped.get(path);
+		return !!(e && e.stamp === stamp);
+	}
+
+	// programOf is what spawn runs: a compiled module given, a program kept
+	// by stamp, bytes given, or argv[0] resolved in jsfs.
+	function programOf(opts, argv0, cwd, env) {
+		if (opts.module) return { path: argv0, module: opts.module };
+		const stamp = opts.stamp === undefined || opts.stamp === null ? null : String(opts.stamp);
+		if (stamp !== null && cached(argv0, stamp)) return { path: argv0, module: stamped.get(argv0).mod };
+		if (opts.bytes) return { path: argv0, bytes: opts.bytes, stamp };
+		return readProgram(argv0, cwd, env);
+	}
+
 	async function resolveModule(prog) {
 		if (prog.module) return prog.module;
-		if (prog.uncached) return WebAssembly.compile(prog.bytes);
+		if (prog.stamp !== undefined) {
+			const mod = await WebAssembly.compile(prog.bytes);
+			if (prog.stamp !== null) stamped.set(prog.path, { stamp: prog.stamp, mod });
+			return mod;
+		}
 		const hit = moduleCache.get(prog.path);
 		if (hit) return hit;
 		const load = loaders.get(prog.path);
@@ -881,7 +907,7 @@ self.onmessage = async (ev) => {
 	globalThis.proc = {
 		installed: true,
 		spawn, spawnWorker, pipeSink, pipeSource, assets,
-		resize, tty: ttyOf, self,
+		resize, tty: ttyOf, self, cached,
 		registerModule, registerURL, compileURL,
 		// The two page-lifetime registries. Exposed so a page can name them
 		// under its own globals (a child's Go signal handler registers into
