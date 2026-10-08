@@ -5,13 +5,14 @@
 // an exact analog: instantiating another wasm module IS spawning a process.
 // proc makes that a primitive.
 //
-//   globalThis.proc.spawn({argv, env, cwd, stdout, stderr, stdin})
-//     -> { pid, id, exited: Promise<exitCode>, kill() }
+//   globalThis.proc.spawn({argv, env, cwd, stdout, stderr, stdin, tty})
+//     -> { pid, id, exited: Promise<exitCode>, kill(force), stdin, resize(c, r) }
 //
 // - argv[0] is resolved against jsfs (absolute, cwd-relative, or PATH-walked);
 //   the file's bytes ARE the program. Compiled modules are cached by path so
 //   repeat spawns skip the compile. A program too big to hold as bytes is
-//   bound to its path with registerModule / registerURL instead.
+//   bound to its path with registerModule / registerURL instead, and a caller
+//   that keeps programs elsewhere passes opts.bytes or opts.module.
 // - The child shares globalThis.fs (jsfs) and globalThis.vnet — that sharing
 //   is the whole point: a parent writes $WORK, the child compiler reads it.
 //   When it exits, the vnet claims it could not unlisten are released for it.
@@ -20,6 +21,14 @@
 //   active set is swapped around each wasm execution slice (each _resume is
 //   synchronous and atomic on the one JS thread), so interleaved processes
 //   never cross streams. Pipe them together with proc.pipe().
+// - opts.stdin "pipe" gives the child a stdin it can wait on, as a program
+//   reading a terminal does: the handle's stdin.write(bytes) feeds it and
+//   stdin.close() ends it. A function there is a synchronous puller instead.
+// - opts.tty {cols, rows, onRaw} makes the child a terminal program: it finds
+//   its size, sets raw mode and hears of resizes through proc.tty(its id), and
+//   the parent resizes it with proc.resize(id, cols, rows).
+// - kill() interrupts through the child's own handler when it registered one,
+//   and otherwise, or with kill(true), stops it where it stands: exit 130.
 // - wait is the child's exit promise; the Go runtime's wasmExit resolves it.
 // - every process has an id (opts.id, else "p<pid>"), handed to the child in
 //   the env vars named by opts.idEnv (default ["BOTTLE_PID"]). It keys kill()
@@ -78,6 +87,8 @@
 		stdio.stdout = out;
 		stdio.stderr = err;
 		stdio.stdin = inp;
+		// A child with a stdin pipe has its fd 0 reads wait on it (jsfs).
+		stdio.stdinPipe = () => (active && active.stdinPipe >= 0 ? active.stdinPipe : -1);
 	}
 
 	const moduleCache = new Map(); // path -> WebAssembly.Module
@@ -222,14 +233,74 @@
 	// the main ring in seconds under debug spam.
 	const tails = Object.create(null);
 
+	// stoppers: id -> the hard kill of a running main-thread child. Set by
+	// spawn and deleted at reap, so it pins the program only while it runs.
+	const stoppers = Object.create(null);
+
+	// ttys: id -> the terminal record of a child spawned with opts.tty.
+	const ttys = Object.create(null);
+
 	function makeKill(id) {
-		return function () {
+		return function (force) {
 			try {
 				const h = signals[id];
-				if (h) h();
-				return !!h;
-			} catch (e) { return false; } // instance already gone
+				if (h && !force) { h(); return true; }
+			} catch (e) { /* instance already gone */ }
+			const stop = stoppers[id];
+			return stop ? stop() : false;
 		};
+	}
+
+	// makeTTY builds a child's terminal: its size, its raw flag, and the
+	// methods the child calls through proc.tty(id). Module scope, closing over
+	// the plain record only.
+	//
+	// Every call that crosses to the other side goes through a microtask. The
+	// parent's onRaw is usually a Go function in the PARENT's runtime, and a
+	// resize listener is one in the CHILD's; called inline, either would run a
+	// second Go runtime on top of the first one's stack (see deliver).
+	function makeTTY(o) {
+		const t = {
+			cols: Math.max(1, o.cols | 0) || 80,
+			rows: Math.max(1, o.rows | 0) || 24,
+			raw: false,
+			onRaw: typeof o.onRaw === "function" ? o.onRaw : null,
+			listeners: [],
+		};
+		t.api = {
+			size: () => [t.cols, t.rows],
+			raw: () => t.raw,
+			setRaw(on) {
+				on = !!on;
+				if (t.raw === on) return;
+				t.raw = on;
+				const f = t.onRaw;
+				if (f) queueMicrotask(() => { try { f(on); } catch (e) { /* parent gone */ } });
+			},
+			onResize(fn) { if (typeof fn === "function") t.listeners.push(fn); },
+		};
+		return t;
+	}
+
+	// resize changes a child terminal's size and tells the child, later.
+	function resize(id, cols, rows) {
+		const t = ttys[id];
+		if (!t) return false;
+		cols = Math.max(1, cols | 0);
+		rows = Math.max(1, rows | 0);
+		if (t.cols === cols && t.rows === rows) return true;
+		t.cols = cols;
+		t.rows = rows;
+		for (const fn of t.listeners) {
+			queueMicrotask(() => { if (ttys[id] === t) { try { fn(cols, rows); } catch (e) { /* child gone */ } } });
+		}
+		return true;
+	}
+
+	// ttyOf is the child's side: its terminal, or null when it has none.
+	function ttyOf(id) {
+		const t = ttys[id];
+		return t ? t.api : null;
 	}
 
 	// tailSink wraps a stderr sink so the bytes are also kept in rec. Built HERE
@@ -265,6 +336,8 @@
 	// the port against a rebind. Module scope, and takes only the id.
 	function reap(id) {
 		try { delete signals[id]; } catch (e) { /* ignore */ }
+		delete stoppers[id];
+		delete ttys[id];
 		try {
 			const v = globalThis.vnet;
 			if (v && v.releaseOwner) {
@@ -286,14 +359,16 @@
 		let cwd = opts.cwd || jsfs.getCwd();
 		const env = opts.env || {};
 
-		const prog = readProgram(argv[0], cwd, env);
+		const prog = opts.module ? { path: argv[0], module: opts.module }
+			: opts.bytes ? { path: argv[0], bytes: opts.bytes, uncached: true }
+			: readProgram(argv[0], cwd, env);
 		const pid = nextPID++;
 		const id = opts.id || ("p" + pid);
 		if (!prog) {
 			// No such file: a real ENOENT, surfaced as a nonzero exit so a
 			// shell prints "not found" rather than hanging.
 			(opts.stderr || pageDefaults.stderr)(new TextEncoder().encode(argv[0] + ": not found\n"));
-			return { pid, id, exited: Promise.resolve(127), kill: () => false };
+			return { pid, id, exited: Promise.resolve(127), kill: makeKill(id), stdin: closedStdin, resize: makeResize(id) };
 		}
 
 		// The post-mortem ring, when asked for. Registered BEFORE the program
@@ -304,19 +379,37 @@
 			tails[id] = rec;
 		}
 
+		// A stdin pipe: the child holds the read end through stdio.stdinPipe,
+		// the caller the write end through the handle's stdin.
+		let stdinR = -1, stdinW = -1;
+		if (opts.stdin === "pipe") [stdinR, stdinW] = jsfs.pipe();
 		const myStdio = {
 			stdout: opts.stdout || pageDefaults.stdout,
 			stderr: opts.stderr || pageDefaults.stderr,
-			stdin: opts.stdin || pageDefaults.stdin,
+			stdin: typeof opts.stdin === "function" ? opts.stdin : pageDefaults.stdin,
+			stdinPipe: stdinR,
 		};
 		if (rec) myStdio.stderr = tailSink(rec, myStdio.stderr, opts.tail, opts.tailFilter || null);
+		if (opts.tty) ttys[id] = makeTTY(opts.tty);
 
 		let exitCode = 0;
 		let crashed = false;
+		// The hard kill. Until the program is running it only marks the spawn
+		// cancelled; once it is, it ends the run where it stands (below).
+		let cancelled = false;
+		let stopRun = null;
+		stoppers[id] = () => {
+			if (cancelled) return false;
+			cancelled = true;
+			exitCode = 130;
+			if (stopRun) stopRun();
+			return true;
+		};
 		const exited = (async () => {
 			// The Go loader and the program compile in parallel; both may be a
 			// network fetch on the first spawn.
 			const [, mod] = await Promise.all([ensureGo(), resolveModule(prog)]);
+			if (cancelled) return 130;
 
 			const go = new Go();
 			go.argv = argv.slice();
@@ -367,18 +460,33 @@
 			}
 
 			const inst = await WebAssembly.instantiate(mod, go.importObject);
+			if (cancelled) return 130;
+			// A hard kill marks the program exited — the _resume guard above then
+			// turns every later callback into it into a no-op — cancels its
+			// timers, and ends the wait for it. Called from the caller's stack,
+			// never from inside the child's own slice, since one thread runs
+			// one of them at a time.
+			const killed = new Promise((res) => {
+				stopRun = () => {
+					go.exited = true;
+					clearTimers(go);
+					res();
+				};
+			});
 			// run executes the first slice before it returns its promise, so the
 			// page's stdio and directory come back as soon as that slice ends.
 			const t = enter();
 			let running;
 			try { running = go.run(inst); } finally { leave(t); }
 			try {
-				await running; // resolves when the program exits
+				await Promise.race([running, killed]); // the program exits, or is killed
 			} catch (e) {
 				crashed = true;
 				throw e;
 			} finally {
 				reap(id);
+				stopRun = null;
+				closeStdin(stdinR, stdinW);
 				if (rec) rec.exitInfo = { code: exitCode, crashed: crashed };
 				// Cancel any timer callbacks the child's Go runtime still had
 				// pending. Stock wasm_exec never clears _scheduledTimeouts on
@@ -389,12 +497,7 @@
 				// pegging the thread and hanging the page. A short-lived child
 				// (compile -V=full) rarely has one pending; a real compile
 				// does, which is why it hung and version queries did not.
-				if (go._scheduledTimeouts) {
-					for (const h of go._scheduledTimeouts.values()) {
-						try { clearTimeout(h); } catch (e) {}
-					}
-					go._scheduledTimeouts.clear();
-				}
+				clearTimers(go);
 				// JS callbacks the program registered can outlive it and keep go
 				// reachable, and go.mem alone pins the whole wasm memory.
 				go.mem = null;
@@ -406,10 +509,53 @@
 			// phase's cleanup, so do it here: the ring must still record how
 			// this process ended, and nothing should be left registered.
 			reap(id);
+			closeStdin(stdinR, stdinW);
 			if (rec && !rec.exitInfo) rec.exitInfo = { code: exitCode || 1, crashed: true };
 			throw e;
 		});
-		return { pid, id, exited, kill: makeKill(id) };
+		return { pid, id, exited, kill: makeKill(id), stdin: stdinW >= 0 ? stdinOf(stdinW) : closedStdin, resize: makeResize(id) };
+	}
+
+	// makeResize is the handle's resize, built here so the handle a caller keeps
+	// closes over the id alone and never over a spawn frame.
+	function makeResize(id) {
+		return (cols, rows) => resize(id, cols, rows);
+	}
+
+	// closedStdin is the stdin of a child spawned without a pipe.
+	const closedStdin = Object.freeze({ write: () => false, close: () => {} });
+
+	// stdinOf is the caller's end of a child's stdin pipe. A write after the
+	// child has gone reports false rather than throwing.
+	function stdinOf(w) {
+		let open = true;
+		return {
+			write(b) {
+				if (!open) return false;
+				try { globalThis.fs.writeSync(w, b); return true; } catch (e) { return false; }
+			},
+			close() {
+				if (!open) return;
+				open = false;
+				try { globalThis.fs.pipeRelease(w); } catch (e) { /* gone */ }
+			},
+		};
+	}
+
+	// closeStdin drops a finished child's stdin pipe. A read it was still
+	// waiting in is forgotten, not answered: there is no program to answer.
+	function closeStdin(r, w) {
+		if (r >= 0) jsfs.pipeDrop(r);
+		else if (w >= 0) jsfs.pipeDrop(w);
+	}
+
+	// clearTimers cancels the timer callbacks a Go runtime still had pending.
+	function clearTimers(go) {
+		if (!go._scheduledTimeouts) return;
+		for (const h of go._scheduledTimeouts.values()) {
+			try { clearTimeout(h); } catch (e) { /* ignore */ }
+		}
+		go._scheduledTimeouts.clear();
 	}
 
 	// idEnvNames normalises opts.idEnv: a string, a list, or the default.
@@ -422,6 +568,8 @@
 	// resolveModule turns a resolved program into a compiled module: the cache
 	// first, then a registered URL loader, then the bytes from jsfs.
 	async function resolveModule(prog) {
+		if (prog.module) return prog.module;
+		if (prog.uncached) return WebAssembly.compile(prog.bytes);
 		const hit = moduleCache.get(prog.path);
 		if (hit) return hit;
 		const load = loaders.get(prog.path);
@@ -634,6 +782,7 @@ self.onmessage = async (ev) => {
 	globalThis.proc = {
 		installed: true,
 		spawn, spawnWorker, pipeSink, pipeSource, assets,
+		resize, tty: ttyOf,
 		registerModule, registerURL, compileURL,
 		// The two page-lifetime registries. Exposed so a page can name them
 		// under its own globals (a child's Go signal handler registers into

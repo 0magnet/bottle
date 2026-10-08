@@ -25,7 +25,9 @@
 // Stdout/stderr: fds 1 and 2 route through jsfs.stdio, a swappable sink so
 // the terminal can capture the CURRENT command's output; instances run
 // sequentially in the shell, so a single active sink suffices. fd 0 reads
-// return EOF by default.
+// return EOF by default. A process with a stdin pipe names it through
+// jsfs.stdio.stdinPipe (a function returning its read fd, or -1), and a read
+// with a callback — Go's — then waits on that pipe as on any other.
 //
 // In-memory only: page lifetime, no quota, no persistence (an IndexedDB
 // snapshot can layer on later without changing this contract).
@@ -177,6 +179,7 @@
 		stdout: (buf) => console.log(td.decode(buf)),
 		stderr: (buf) => console.error(td.decode(buf)),
 		stdin: () => null, // return Uint8Array or null for EOF
+		stdinPipe: () => -1, // a pipe read fd that fd 0 reads wait on, or -1
 	};
 
 	// ---- fd table ----------------------------------------------------------
@@ -274,6 +277,20 @@
 		return true;
 	}
 	function isPipe(fd) { return pipeEnds.has(fd); }
+	// pipeDrop closes both ends of fd's pipe outright, whatever references are
+	// held, and forgets its waiting readers without calling them: they belong
+	// to a program that is gone, and a callback into it would fail.
+	function pipeDrop(fd) {
+		const e = pipeEnds.get(fd);
+		if (!e) return false;
+		const p = e.pipe;
+		p.readers.length = 0;
+		p.chunks.length = 0;
+		p.wRefs = 0;
+		p.rRefs = 0;
+		for (const [k, v] of pipeEnds) if (v.pipe === p) pipeEnds.delete(k);
+		return true;
+	}
 
 	// ---- constants (node names; values mirror Linux) -----------------------
 	const constants = {
@@ -405,6 +422,8 @@
 		// bytes have not landed answer EAGAIN, and the lazy fetch is started.
 		read(fd, buf, offset, length, position) {
 			if (fd === 0) {
+				const pfd = stdio.stdinPipe ? stdio.stdinPipe() : -1;
+				if (pfd >= 0 && isPipe(pfd)) return pipeReadNow(pfd, buf, offset, length);
 				const chunk = stdio.stdin();
 				if (!chunk || chunk.length === 0) return 0;
 				const n = Math.min(length, chunk.length);
@@ -531,6 +550,8 @@
 		read(fd, buf, offset, length, position, cb) {
 			try {
 				if (fd === 0) {
+					const pfd = stdio.stdinPipe ? stdio.stdinPipe() : -1;
+					if (pfd >= 0 && isPipe(pfd)) { pipeReadInto(pfd, buf, offset, length, cb); return; }
 					const chunk = stdio.stdin();
 					if (!chunk || chunk.length === 0) { queueMicrotask(() => cb(null, 0)); return; }
 					const n = Math.min(length, chunk.length);
@@ -1053,6 +1074,7 @@
 		setCwd(d) { processImpl.chdir(d); },
 		pipe() { return makePipe(); },        // [readFd, writeFd]
 		isPipe(fd) { return isPipe(fd); },
+		pipeDrop(fd) { return pipeDrop(fd); }, // close a pipe for good, silently
 		getCwd() { return cwd; },
 		persist,         // IndexedDB snapshots: enable(db) → Promise<{restored}>
 		mount,           // mount(prefix, provider): hand a subtree to a provider
