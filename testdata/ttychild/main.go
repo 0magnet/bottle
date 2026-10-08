@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/0magnet/bottle/proc"
 )
@@ -30,7 +31,7 @@ func main() {
 	t.OnResize(func(c, r int) { fmt.Fprintf(out, "resized %dx%d\n", c, r) })
 	t.SetRaw(true)
 	c, r := t.Size()
-	fmt.Fprintf(out, "ready %dx%d %s\n", c, r, proc.Getenv("GREETING"))
+	fmt.Fprintf(out, "ready %dx%d %s\n", c, r, strings.Join(append([]string{proc.Getenv("GREETING")}, proc.Args()[1:]...), " "))
 	sc := bufio.NewScanner(in)
 	for sc.Scan() {
 		if sc.Text() == "q" {
