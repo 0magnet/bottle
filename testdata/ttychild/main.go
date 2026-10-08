@@ -30,7 +30,7 @@ func main() {
 	t.OnResize(func(c, r int) { fmt.Fprintf(out, "resized %dx%d\n", c, r) })
 	t.SetRaw(true)
 	c, r := t.Size()
-	fmt.Fprintf(out, "ready %dx%d\n", c, r)
+	fmt.Fprintf(out, "ready %dx%d %s\n", c, r, proc.Getenv("GREETING"))
 	sc := bufio.NewScanner(in)
 	for sc.Scan() {
 		if sc.Text() == "q" {

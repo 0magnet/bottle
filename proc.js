@@ -347,6 +347,13 @@
 		return active && active.id ? active.id : null;
 	}
 
+	// environ is the environment of the process whose slice is running — a
+	// copy, with its id under the idEnv names — or null on the page's own time.
+	// A program stock TinyGo built is handed none any other way.
+	function environ() {
+		return active && active.env ? Object.assign({}, active.env) : null;
+	}
+
 	// ttyOf is the child's side: its terminal, or null when it has none.
 	function ttyOf(id) {
 		const t = ttys[id];
@@ -437,8 +444,10 @@
 			stdin: typeof opts.stdin === "function" ? opts.stdin : pageDefaults.stdin,
 			stdinPipe: stdinR,
 			id,
+			env: Object.assign({}, env),
 		};
 		if (rec) myStdio.stderr = tailSink(rec, myStdio.stderr, opts.tail, opts.tailFilter || null);
+		for (const k of idEnvNames(opts)) myStdio.env[k] = id;
 		if (opts.tty) ttys[id] = makeTTY(opts.tty, myStdio);
 
 		let exitCode = 0;
@@ -907,7 +916,7 @@ self.onmessage = async (ev) => {
 	globalThis.proc = {
 		installed: true,
 		spawn, spawnWorker, pipeSink, pipeSource, assets,
-		resize, tty: ttyOf, self, cached,
+		resize, tty: ttyOf, self, environ, cached,
 		registerModule, registerURL, compileURL,
 		// The two page-lifetime registries. Exposed so a page can name them
 		// under its own globals (a child's Go signal handler registers into

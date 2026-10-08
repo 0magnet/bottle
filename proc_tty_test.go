@@ -37,7 +37,7 @@ const waitFor = (h, s) => new Promise((res, rej) => {
 const start = (o) => {
 	const h = { text: '', raws: [] };
 	h.p = proc.spawn(Object.assign({
-		argv: ['child'], env: { PATH: '/bin' }, stdin: 'pipe',
+		argv: ['child'], env: { PATH: '/bin', GREETING: 'hi' }, stdin: 'pipe',
 		tty: { cols: 80, rows: 24, onRaw: (on) => h.raws.push(on) },
 		stdout: (b) => { h.text += td.decode(b); },
 	}, o));
@@ -46,7 +46,7 @@ const start = (o) => {
 (async () => {
 	// keys, a resize, and q
 	let h = start({});
-	await waitFor(h, 'ready 80x24\n');
+	await waitFor(h, 'ready 80x24 hi\n');
 	h.p.stdin.write(te.encode('hello\n'));
 	await waitFor(h, 'got hello\n');
 	h.p.resize(100, 30);
@@ -83,7 +83,7 @@ const start = (o) => {
 		globalThis.importScripts = (u) => vm.runInThisContext(nodefs.readFileSync(u, 'utf8'));
 		const pageGo = globalThis.Go;
 		h = start({ bytes: TINY });
-		await waitFor(h, 'ready 80x24\n');
+		await waitFor(h, 'ready 80x24 hi\n');
 		h.p.stdin.write(te.encode('tiny\n'));
 		await waitFor(h, 'got tiny\n');
 		h.p.resize(90, 20);
@@ -168,7 +168,7 @@ func TestProcTTY(t *testing.T) {
 		want = append(want, `tinygo=4 raws=true,false pageGo=true`)
 	}
 	want = append(want,
-		`run code=4 err=<nil> out="ready 40x10\ngot a\n" raws=[true false]`,
+		`run code=4 err=<nil> out="ready 40x10 \ngot a\n" raws=[true false]`,
 		`kill=true`,
 		`killed code=130 err=<nil> write=io: read/write on closed pipe`,
 	)

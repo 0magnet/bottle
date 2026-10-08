@@ -28,12 +28,7 @@ func Term() (*Terminal, bool) {
 	if !proc.Truthy() || !proc.Get("tty").Truthy() {
 		return nil, false
 	}
-	id := os.Getenv("BOTTLE_PID")
-	if id == "" && proc.Get("self").Truthy() {
-		if v := proc.Call("self"); v.Truthy() {
-			id = v.String()
-		}
-	}
+	id := Getenv("BOTTLE_PID")
 	if id == "" {
 		return nil, false
 	}
@@ -42,6 +37,25 @@ func Term() (*Terminal, bool) {
 		return nil, false
 	}
 	return &Terminal{v: v}, true
+}
+
+// Getenv is os.Getenv for a program proc spawned, which works whichever
+// toolchain built it: stock TinyGo hands a program no environment, so what
+// os.Getenv cannot find is asked of proc, which knows the one it was given.
+func Getenv(name string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	proc := js.Global().Get("proc")
+	if !proc.Truthy() || !proc.Get("environ").Truthy() {
+		return ""
+	}
+	if env := proc.Call("environ"); env.Truthy() {
+		if v := env.Get(name); v.Type() == js.TypeString {
+			return v.String()
+		}
+	}
+	return ""
 }
 
 // Size is the terminal's size in cells.
