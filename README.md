@@ -43,16 +43,37 @@ a few page-global primitives:
   `tty: {cols, rows, onRaw}` gives it a size, raw mode and resizes
   (`proc.tty(id)` in the child, `proc.resize(id, cols, rows)` in the parent).
   `kill()` uses the child's own interrupt handler when it has one and
-  otherwise stops it outright (exit 130). The **`proc`** subpackage is its Go
-  adapter: `proc.Command(...).Run()` or `Start()`, os/exec-shaped, with
-  `Kill` and `Resize`, and `proc.Term()` on the child's side.
+  otherwise stops it outright (exit 130). The loader is chosen by the
+  module's imports: Go's `wasm_exec.js` or TinyGo's, from `proc.assets`
+  (`wasmExecGo`, `wasmExecTinyGo`). A module is compiled once per path when
+  spawned with `opts.stamp` (any string that changes when the program does);
+  `proc.cached(path, stamp)` says whether a spawn needs no bytes at all.
+  The **`proc`** subpackage is its Go adapter: `proc.Command(...).Run()` or
+  `Start()`, os/exec-shaped, with `Kill` and `Resize`. `Cmd.Program` and
+  `Cmd.Stamp` carry a program kept outside jsfs and compile it once, and
+  `proc.Cached(path, stamp)` reports whether that is already done. On the
+  child's side `proc.Term()` returns a `Terminal` (`Size`, `SetRaw`,
+  `OnResize`, `Read`, `Write`), and `proc.Getenv` and `proc.Args` stand in for
+  `os.Getenv` and `os.Args`, which TinyGo does not fill for a js program, by
+  asking proc. See [example/proc](example/proc) for a parent and child.
 - **`fsbridge.js`** — the same filesystem, reachable from a Worker.
   `proc.spawnWorker` runs a child off the main thread, so a long compile no
   longer freezes the tab, and several can run at once. jsfs stays on the thread
   that owns it; the child blocks in `Atomics.wait` while the page answers,
   which is the synchronous syscall contract Go's runtime requires. Needs
   cross-origin isolation (COOP/COEP) for `SharedArrayBuffer`; without it
-  `spawnWorker` refuses and callers fall back to `proc.spawn`.
+  `spawnWorker` refuses and callers fall back to `proc.spawn`;
+  `proc.OffThreadAvailable()` says which to expect, and `Cmd.OffThread` in the
+  Go adapter falls back on its own.
+- **`vnet-sw.js`** — a service worker that turns vnet ports into same-origin
+  URLs, `/vnet/<port>/...`, so an iframe can load an in-page server with
+  native resolution. The page calls `vnet.enableSW()`; `bottle.VNetSWJS()`
+  serves the worker.
+- **`coi-sw.js`** and **`coi-register.js`** — a service worker that re-serves
+  the page with COOP and COEP headers, for a host such as GitHub Pages that
+  cannot set them, so `SharedArrayBuffer` and `spawnWorker` work. The register
+  script reloads once after the worker takes control. `bottle.COISWJS()` and
+  `bottle.COIRegisterJS()` serve them.
 
 The **`vnet`** Go subpackage is the adapter: `vnet.Listen` /
 `vnet.DialTimeout` are exactly `net.Listen` / `net.DialTimeout` on native
@@ -68,6 +89,8 @@ Embed and serve the scripts ahead of any wasm module (Go captures
 import "github.com/0magnet/bottle"
 
 page := append(bottle.JSFS(), bottle.VNetJS()...) // then your own JS
+page = append(page, bottle.ProcJS()...)            // process layer
+// bottle.FSBridgeJS() is served as a file beside proc.js; the worker loads it by URL
 ```
 
 Seed application layout after `jsfs.js` runs, from a page script:
@@ -100,8 +123,10 @@ Notes:
 
 - `vnet` conns honor `SetReadDeadline` including waking an already-blocked
   Read — `net/http`'s response teardown depends on that.
-- In-memory only: page lifetime, no persistence, single JS realm (a
-  MessagePort bridge across Workers can layer on later).
+- Memory first: the filesystem lives for the page, and one JS realm owns it.
+  `jsfs.persist.enable(db)` restores and then auto-saves a snapshot in
+  IndexedDB, so configs and user files survive a reload. Workers reach the
+  same filesystem through `fsbridge.js`.
 
 Grown in [skycoin/skywire](https://github.com/skycoin/skywire), where the
 whole skywire binary runs in the docs-site terminal: `skywire autoconfig` in
@@ -154,12 +179,13 @@ gocloc --not-match-d='(vendor|node_modules|\.git)' .
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-JavaScript                       4             86            288           1020
-Go                               6             60            122            398
+JavaScript                       7            208            829           2473
+Go                              17            146            304           1426
+Markdown                         2             36              0            168
+Makefile                         1             21             52            111
 YAML                             1              0              7             98
-Markdown                         2             22              0             75
 HTML                             1              0              2             18
 -------------------------------------------------------------------------------
-TOTAL                           14            168            419           1609
+TOTAL                           29            411           1194           4294
 -------------------------------------------------------------------------------
 ```
