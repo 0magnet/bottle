@@ -38,8 +38,14 @@ a few page-global primitives:
   `proc.registerURL(path, url)` binds a program too large to hold as bytes to
   its path, streaming it into the compiler on first spawn instead of through
   jsfs. `opts.tail` keeps a per-process stderr ring in `proc.tails`, so a
-  crashed child's last words survive it. The **`proc`** subpackage is its Go
-  adapter (`proc.Command(...).Run()`, os/exec-shaped).
+  crashed child's last words survive it. A child can be a terminal program:
+  `stdin: "pipe"` gives it a stdin it waits on (`handle.stdin.write`), and
+  `tty: {cols, rows, onRaw}` gives it a size, raw mode and resizes
+  (`proc.tty(id)` in the child, `proc.resize(id, cols, rows)` in the parent).
+  `kill()` uses the child's own interrupt handler when it has one and
+  otherwise stops it outright (exit 130). The **`proc`** subpackage is its Go
+  adapter: `proc.Command(...).Run()` or `Start()`, os/exec-shaped, with
+  `Kill` and `Resize`, and `proc.Term()` on the child's side.
 - **`fsbridge.js`** — the same filesystem, reachable from a Worker.
   `proc.spawnWorker` runs a child off the main thread, so a long compile no
   longer freezes the tab, and several can run at once. jsfs stays on the thread
