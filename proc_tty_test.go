@@ -126,7 +126,7 @@ func TestProcTTY(t *testing.T) {
 		`notty=2`,
 		`run code=4 err=<nil> out="ready 40x10\ngot a\n" raws=[true false]`,
 		`kill=true`,
-		`killed code=130 err=<nil>`,
+		`killed code=130 err=<nil> write=io: read/write on closed pipe`,
 	}, "\n")
 	// node's console.log ends each of the parent's writes with a newline of
 	// its own.

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"syscall/js"
 )
 
@@ -30,6 +31,8 @@ type Cmd struct {
 
 	// TTY, if set, gives the child a terminal; see TTY.
 	TTY *TTY
+
+	stdin *stdinPipe
 
 	// OffThread runs the child in a Worker instead of on the page's one JS
 	// thread, so a long build does not freeze the tab. The child still sees
@@ -78,6 +81,7 @@ type Process struct {
 
 	v     js.Value
 	funcs []js.Func
+	out   *outQueue
 	done  chan struct{}
 	code  int
 	err   error
@@ -96,16 +100,17 @@ func (c *Cmd) Run() (int, error) {
 
 // Start spawns the child and returns without waiting for it.
 //
-// Its output reaches Stdout and Stderr as it is written, each write in a
-// callback of its own: a writer there must not block, or the page stalls
-// with it. Stdin is copied into the child's stdin pipe by a goroutine, and
-// a child reading it waits as one reading a terminal does.
+// Its output reaches Stdout and Stderr as it is written, in order, from a
+// goroutine of the process's own, so a writer there may block — a pipe to the
+// next command — without stalling the page. Stdin is copied into the child's
+// stdin pipe by another, and a child reading it waits as one reading a
+// terminal does.
 func (c *Cmd) Start() (*Process, error) {
 	proc := js.Global().Get("proc")
 	if !proc.Truthy() {
 		return nil, errors.New("proc: proc.js not loaded on this page")
 	}
-	p := &Process{done: make(chan struct{})}
+	p := &Process{done: make(chan struct{}), out: newOutQueue()}
 	fn := func(f func(_ js.Value, args []js.Value) any) js.Func {
 		jf := js.FuncOf(f)
 		p.funcs = append(p.funcs, jf)
@@ -130,17 +135,17 @@ func (c *Cmd) Start() (*Process, error) {
 	opts.Set("env", env)
 
 	if c.Stdout != nil {
-		opts.Set("stdout", fn(sink(c.Stdout)))
+		opts.Set("stdout", fn(p.out.sink(c.Stdout)))
 	}
 	if c.Stderr != nil {
-		opts.Set("stderr", fn(sink(c.Stderr)))
+		opts.Set("stderr", fn(p.out.sink(c.Stderr)))
 	}
 
 	method := "spawn"
 	if c.OffThread && OffThreadAvailable() {
 		method = "spawnWorker" // a worker child's stdin reads EOF, and it has no terminal
 	} else {
-		if c.Stdin != nil {
+		if c.Stdin != nil || c.stdin != nil {
 			opts.Set("stdin", "pipe")
 		}
 		if c.TTY != nil {
@@ -160,9 +165,17 @@ func (c *Cmd) Start() (*Process, error) {
 	p.v = proc.Call(method, opts)
 	p.ID = p.v.Get("id").String()
 	p.Pid = p.v.Get("pid").Int()
-	if c.Stdin != nil && method == "spawn" {
-		go feed(c.Stdin, p.v.Get("stdin"))
+	if method == "spawn" {
+		switch {
+		case c.stdin != nil:
+			c.stdin.set(p.v.Get("stdin"))
+		case c.Stdin != nil:
+			go feed(c.Stdin, p.v.Get("stdin"))
+		}
+	} else if c.stdin != nil {
+		c.stdin.set(js.Null())
 	}
+	go p.out.run()
 	go func() {
 		code, err := await(p.v.Get("exited"))
 		if err != nil {
@@ -170,6 +183,9 @@ func (c *Cmd) Start() (*Process, error) {
 		} else {
 			p.code = code.Int()
 		}
+		// Output written before the exit was handed over on microtasks ahead
+		// of it, so it is all queued by now.
+		p.out.finish()
 		close(p.done)
 	}()
 	return p, nil
@@ -178,8 +194,7 @@ func (c *Cmd) Start() (*Process, error) {
 // Wait blocks until the child exits and returns its exit code.
 func (p *Process) Wait() (int, error) {
 	<-p.done
-	// Output already written was queued on microtasks ahead of the exit, so
-	// the sinks have run; nothing calls them now.
+	// The sinks have run and the output is written; nothing calls them now.
 	for _, f := range p.funcs {
 		f.Release()
 	}
@@ -218,18 +233,124 @@ func feed(r io.Reader, stdin js.Value) {
 	}
 }
 
-// sink adapts an io.Writer to proc.js's stdout/stderr callback, which is
-// called with a Uint8Array chunk per write.
-func sink(w io.Writer) func(js.Value, []js.Value) any {
+// StdinPipe returns a pipe to the child's stdin, as os/exec's does, for a
+// caller that must decide itself when to stop feeding it: a terminal, whose
+// reader must not outlive the child and eat the shell's next key. Call it
+// before Start, and Close it to give the child the end of its input. A Write
+// after the child has gone fails with io.ErrClosedPipe.
+func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
+	if c.Stdin != nil {
+		return nil, errors.New("proc: Stdin already set")
+	}
+	if c.stdin != nil {
+		return nil, errors.New("proc: StdinPipe already called")
+	}
+	c.stdin = &stdinPipe{ready: make(chan struct{})}
+	return c.stdin, nil
+}
+
+type stdinPipe struct {
+	v     js.Value
+	ready chan struct{}
+}
+
+func (w *stdinPipe) set(v js.Value) {
+	w.v = v
+	close(w.ready)
+}
+
+func (w *stdinPipe) Write(b []byte) (int, error) {
+	<-w.ready
+	if w.v.IsNull() {
+		return 0, io.ErrClosedPipe
+	}
+	u := js.Global().Get("Uint8Array").New(len(b))
+	js.CopyBytesToJS(u, b)
+	if !w.v.Call("write", u).Truthy() {
+		return 0, io.ErrClosedPipe
+	}
+	return len(b), nil
+}
+
+func (w *stdinPipe) Close() error {
+	<-w.ready
+	if !w.v.IsNull() {
+		w.v.Call("close")
+	}
+	return nil
+}
+
+// outQueue carries a child's output from proc.js's sinks to the caller's
+// writers. The sinks run as JS callbacks, where a blocking Write would stall
+// every callback on the page behind it; they only queue, and run writes.
+type outQueue struct {
+	mu    sync.Mutex
+	q     []outChunk
+	kick  chan struct{}
+	ended bool
+	idle  chan struct{}
+}
+
+type outChunk struct {
+	w io.Writer
+	b []byte
+}
+
+func newOutQueue() *outQueue {
+	return &outQueue{kick: make(chan struct{}, 1), idle: make(chan struct{})}
+}
+
+// sink is the callback for one stream; it is called with a Uint8Array chunk
+// per write, already a copy.
+func (o *outQueue) sink(w io.Writer) func(js.Value, []js.Value) any {
 	return func(_ js.Value, args []js.Value) any {
 		if len(args) == 0 {
 			return nil
 		}
 		b := make([]byte, args[0].Get("length").Int())
 		js.CopyBytesToGo(b, args[0])
-		w.Write(b) //nolint:errcheck,gosec // a sink that cannot accept output is the caller's problem, not the child's
+		o.mu.Lock()
+		o.q = append(o.q, outChunk{w, b})
+		o.mu.Unlock()
+		o.poke()
 		return nil
 	}
+}
+
+func (o *outQueue) poke() {
+	select {
+	case o.kick <- struct{}{}:
+	default:
+	}
+}
+
+// run writes what is queued until finish, and then the rest.
+func (o *outQueue) run() {
+	defer close(o.idle)
+	for range o.kick {
+		o.mu.Lock()
+		q, ended := o.q, o.ended
+		o.q = nil
+		o.mu.Unlock()
+		for _, c := range q {
+			c.w.Write(c.b) //nolint:errcheck,gosec // a writer that cannot take output is the caller's problem, not the child's
+		}
+		if ended && len(q) == 0 {
+			return
+		}
+		if len(q) > 0 {
+			o.poke() // look again: more may have come in while writing
+		}
+	}
+}
+
+// finish says nothing more will be queued, and waits for the writes.
+func (o *outQueue) finish() {
+	o.mu.Lock()
+	o.ended = true
+	o.mu.Unlock()
+	o.poke()
+	<-o.idle
 }
 
 // await blocks a goroutine on a JS promise, returning its resolved value or a
