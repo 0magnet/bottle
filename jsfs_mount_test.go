@@ -75,3 +75,47 @@ func TestJSFSMount(t *testing.T) {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
+
+// jsfsRootMountScript hands the whole tree to a provider, as a page does when
+// another thread owns its filesystem.
+const jsfsRootMountScript = `
+const seen = [];
+const provider = {
+	stat(p, cb) { seen.push(p); setTimeout(() => cb(null, { mode: p === '/' || p === '/x' ? 0o40755 : 0o100644, size: 2 }), 1); },
+	readdir(p, cb) { seen.push(p); setTimeout(() => cb(null, ['far']), 1); },
+};
+const P = (f, ...a) => new Promise((res, rej) => fs[f](...a, (err, v) => err ? rej(err) : res(v)));
+(async () => {
+	jsfs.writeFile('/etc/near', 'local');
+	jsfs.mount('/', provider);
+	const out = [];
+	out.push('root=' + (await P('readdir', '/')).join(','));
+	out.push('file=' + (await P('stat', '/etc/near')).isFile());
+	out.push('read=' + jsfs.readFile('/etc/near'));
+	process.chdir('/x/y'); out.push('cwd=' + process.cwd());
+	out.push('seen=' + seen.join(','));
+	jsfs.unmount('/');
+	out.push('after=' + new TextDecoder().decode(jsfs.readFile('/etc/near')));
+	console.log(out.join(' '));
+})().catch((e) => { console.log('FAIL ' + e.code + ' ' + e.message); });
+`
+
+func TestJSFSRootMount(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	script := filepath.Join(t.TempDir(), "root.js")
+	if err := os.WriteFile(script, append(append([]byte{}, JSFS()...), jsfsRootMountScript...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, script).CombinedOutput() //nolint:gosec
+	if err != nil {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	want := "root=far file=true read=null cwd=/x/y seen=/,/etc/near after=local"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
