@@ -76,6 +76,21 @@ const start = (o) => {
 	h = start({ tty: undefined });
 	results.push('notty=' + await h.p.exited);
 
+	// from a mount on the PATH, which can only be read asynchronously
+	const far = new Map([['/bin/child', CHILD]]);
+	const fh = new Map(); let nfh = 1;
+	const later = (f) => setTimeout(f, 1);
+	jsfs.mount('/far', {
+		stat(p, cb) { later(() => far.has(p) ? cb(null, { mode: 0o100755, size: far.get(p).length }) : cb({ code: 'ENOENT' })); },
+		open(p, flags, mode, cb) { later(() => { if (!far.has(p)) { cb({ code: 'ENOENT' }); return; } fh.set(nfh, p); cb(null, nfh++); }); },
+		read(h, len, pos, cb) { later(() => cb(null, far.get(fh.get(h)).subarray(pos, pos + len))); },
+		close(h, cb) { later(() => { fh.delete(h); cb(null); }); },
+	});
+	h = start({ tty: undefined, env: { PATH: '/far/bin:/bin' } });
+	results.push('mounted=' + await h.p.exited + ' ' + JSON.stringify(h.text));
+	h = start({ tty: undefined, argv: ['nochild'], env: { PATH: '/far/bin' }, stderr: (b) => { h.text += td.decode(b); } });
+	results.push('missing=' + await h.p.exited + ' ' + JSON.stringify(h.text));
+
 	// built by TinyGo, on a page whose loader is Go's: its own loader is
 	// fetched for it, and the page keeps Go's
 	if (TINY) {
@@ -163,6 +178,8 @@ func TestProcTTY(t *testing.T) {
 		`again=5`,
 		`kill=true code=130 again=false tty=null resize=false`,
 		`notty=2`,
+		`mounted=2 "no tty\n"`,
+		`missing=127 "nochild: not found\n"`,
 	}
 	if tiny != "" {
 		want = append(want, `tinygo=4 raws=true,false pageGo=true`)
