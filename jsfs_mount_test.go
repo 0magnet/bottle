@@ -45,6 +45,8 @@ const P = (f, ...a) => new Promise((res, rej) => fs[f](...a, (err, v) => err ? r
 	try { await P('rename', '/mnt/peer/b.txt', '/tmp/b.txt'); out.push('rename=ok'); } catch (e) { out.push('rename=' + e.code); }
 	try { await P('mkdir', '/mnt/peer/d', 0o755); } catch (e) { out.push('mkdir=' + e.code); }
 	try { await P('stat', '/mnt/peer/none'); } catch (e) { out.push('missing=' + e.code + ',' + (e instanceof Error)); }
+	process.chdir('/mnt/peer/sub'); out.push('cwd=' + process.cwd()); process.chdir('/');
+	try { process.chdir('/nowhere'); } catch (e) { out.push('chdir=' + e.code); }
 	const open = await P('open', '/mnt/peer/a.txt', 0, 0);
 	jsfs.unmount('/mnt/peer');
 	try { await P('read', open, buf, 0, 8, null); } catch (e) { out.push('after=' + e.code); }
@@ -68,7 +70,7 @@ func TestJSFSMount(t *testing.T) {
 		t.Fatalf("node: %v\n%s", err, out)
 	}
 	got := strings.TrimSpace(string(out))
-	want := "parent=peer isdir=true list=a.txt read=hi b=ok rename=EXDEV mkdir=ENOSYS missing=ENOENT,true after=EIO unmounted=true mounts=0"
+	want := "parent=peer isdir=true list=a.txt read=hi b=ok rename=EXDEV mkdir=ENOSYS missing=ENOENT,true cwd=/mnt/peer/sub chdir=ENOENT after=EIO unmounted=true mounts=0"
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
