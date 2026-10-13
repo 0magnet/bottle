@@ -19,7 +19,11 @@ func TestNativeNamespacesReachTheOS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q dial: %v", prefix, err)
 		}
-		_ = c.Close()
-		_ = l.Close()
+		if err := c.Close(); err != nil {
+			t.Errorf("%q close conn: %v", prefix, err)
+		}
+		if err := l.Close(); err != nil {
+			t.Errorf("%q close listener: %v", prefix, err)
+		}
 	}
 }

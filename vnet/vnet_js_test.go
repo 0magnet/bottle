@@ -30,8 +30,13 @@ func TestHostAddressesGoToTheHostNetwork(t *testing.T) {
 	f := &fakeHost{}
 	SetHost(f)
 	defer SetHost(nil)
-	_, _ = Listen("tcp", "host:0.0.0.0:1080")
-	_, _ = DialTimeout("tcp", "host:127.0.0.1:22", time.Second)
+	// The fake refuses both, so each must come back with its error.
+	if _, err := Listen("tcp", "host:0.0.0.0:1080"); err == nil {
+		t.Fatal("listen through the fake host: no error")
+	}
+	if _, err := DialTimeout("tcp", "host:127.0.0.1:22", time.Second); err == nil {
+		t.Fatal("dial through the fake host: no error")
+	}
 	if f.listened != "0.0.0.0:1080" || f.dialed != "127.0.0.1:22" {
 		t.Fatalf("host network got listen %q dial %q", f.listened, f.dialed)
 	}
